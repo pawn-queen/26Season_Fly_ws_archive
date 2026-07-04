@@ -3,7 +3,7 @@ import math
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition, VehicleStatus, VehicleOdometry
+from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition, VehicleStatus, VehicleOdometry, VehicleLandDetected
 from geometry_msgs.msg import Point
 from std_msgs.msg import Float32
 from collections import deque
@@ -53,6 +53,9 @@ class MissionState(Enum):
     RECON_CYCLE = 13                      # 按顺序飞到每个侦察点
     
     MISSION_COMPLETE = 14
+    REQUEST_RTL = 15
+    RTL_ACTIVE = 16
+    DONE = 17
 
 class OffboardControl(Node):
     """Node for controlling a vehicle in offboard mode."""
@@ -92,6 +95,8 @@ class OffboardControl(Node):
         
         self.vehicle_odometry_subscriber = self.create_subscription(
             VehicleOdometry, '/fmu/out/vehicle_odometry', self.vehicle_odometry_callback, qos_profile)
+        self.vehicle_land_detected_subscriber = self.create_subscription(
+            VehicleLandDetected, '/fmu/out/vehicle_land_detected', self.vehicle_land_detected_callback, qos_profile)
         
         #这是广角相机的内参和畸变参数
         self.camera_matrix = np.array([
@@ -231,6 +236,7 @@ class OffboardControl(Node):
         self.offboard_setpoint_counter = 0
         self.vehicle_local_position = VehicleLocalPosition()
         self.vehicle_status = VehicleStatus()
+        self.vehicle_land_detected = VehicleLandDetected()
         
         self.target_position = None
         self.last_found_x_NED = None
@@ -304,6 +310,9 @@ class OffboardControl(Node):
         self.second_alignment_complete = False
         self.return_to_recon_center = False
         self.reach_initial_position_above = False
+        self.rtl_request_sent = False
+        self.rtl_active_logged = False
+        self.done_logged = False
 
         self.Is_Finish_1st_Drop = False
         self.Is_Finish_2nd_Drop = False
@@ -445,6 +454,10 @@ class OffboardControl(Node):
         """Callback function for vehicle_status topic subscriber."""
         self.vehicle_status = vehicle_status
 
+    def vehicle_land_detected_callback(self, vehicle_land_detected):
+        """Callback function for vehicle_land_detected topic subscriber."""
+        self.vehicle_land_detected = vehicle_land_detected
+
     def vehicle_odometry_callback(self, msg: VehicleOdometry):
         """Callback to get the drone's full attitude (roll, pitch, yaw)."""
         # PX4 odometry msg.q is [w, x, y, z]
@@ -489,6 +502,62 @@ class OffboardControl(Node):
         """Switch to RTL mode."""
         self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_RETURN_TO_LAUNCH)
         self.get_logger().info("Switching to Return-to-Launch (RTL) mode")
+
+    def request_rtl_once(self):
+        """Request RTL once, then stop owning the flight mode from this node."""
+        if not self.rtl_request_sent:
+            self.return_to_launch()
+            self.rtl_request_sent = True
+            self.get_logger().info("已发送一次 RTL 请求，停止 Offboard 模式命令与轨迹控制。")
+
+    def handle_rtl_state(self) -> bool:
+        """
+        Let PX4 own RTL after mission completion or failsafe-triggered RTL.
+        Returns True when the control loop should skip all Offboard outputs.
+        """
+        nav_state = self.vehicle_status.nav_state
+
+        if nav_state == VehicleStatus.NAVIGATION_STATE_AUTO_RTL and self.mission_state not in (
+            MissionState.REQUEST_RTL,
+            MissionState.RTL_ACTIVE,
+            MissionState.DONE,
+        ):
+            self.mission_state = MissionState.RTL_ACTIVE
+            self.rtl_request_sent = True
+            self.get_logger().warn("检测到 PX4 已进入 AUTO_RTL，停止 Offboard 重试并交由 PX4 返航。")
+
+        if self.mission_state == MissionState.REQUEST_RTL:
+            self.request_rtl_once()
+            if nav_state == VehicleStatus.NAVIGATION_STATE_AUTO_RTL:
+                self.mission_state = MissionState.RTL_ACTIVE
+                self.rtl_active_logged = False
+            else:
+                self.get_logger().info(
+                    f"等待 PX4 进入 AUTO_RTL，当前 nav_state={nav_state}；不再重发 Offboard。",
+                    throttle_duration_sec=2,
+                )
+            return True
+
+        if self.mission_state == MissionState.RTL_ACTIVE:
+            if not self.rtl_active_logged:
+                self.get_logger().info("PX4 RTL 已接管；等待返航/降落完成。")
+                self.rtl_active_logged = True
+
+            if (
+                self.vehicle_land_detected.landed
+                or self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_DISARMED
+            ):
+                self.mission_state = MissionState.DONE
+                self.get_logger().info("检测到已降落或已解锁，任务状态切换为 DONE。")
+            return True
+
+        if self.mission_state == MissionState.DONE:
+            if not self.done_logged:
+                self.get_logger().info("任务已完成，保持静默，不再发送飞控指令。")
+                self.done_logged = True
+            return True
+
+        return False
 
     def publish_offboard_control_heartbeat_signal(self):
         """Publish the offboard control mode."""
@@ -1260,6 +1329,10 @@ class OffboardControl(Node):
     def control_timer_callback(self) -> None:
         """Callback function for the timer."""
         timer_start = self.get_clock().now()
+        if self.handle_rtl_state():
+            self.offboard_setpoint_counter += 1
+            return
+
         self.publish_offboard_control_heartbeat_signal()
         
         if not self.is_vision_ready:
@@ -1705,12 +1778,19 @@ class OffboardControl(Node):
                             self.return_to_recon_center = True
                             self.get_logger().info("已经回到侦察区域中心")
                     else:
-                        self.return_to_launch()
-                        self.get_logger().info("所有任务阶段均已完成，RTL。")
+                        self.mission_state = MissionState.REQUEST_RTL
+                        self.get_logger().info("所有任务阶段均已完成，进入 REQUEST_RTL。")
+                        return
         
         else:
             # 只有在过了初始的切换阶段后才打印日志，避免启动时的干扰
             if self.offboard_setpoint_counter >= 10:
+                if self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_AUTO_RTL:
+                    self.mission_state = MissionState.RTL_ACTIVE
+                    self.rtl_request_sent = True
+                    self.get_logger().warn("PX4 已进入 AUTO_RTL，停止 Offboard 重试。")
+                    self.offboard_setpoint_counter += 1
+                    return
                 self.publish_position_setpoint(
                     self.vehicle_local_position.x,
                     self.vehicle_local_position.y,
