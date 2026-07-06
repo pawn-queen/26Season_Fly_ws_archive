@@ -23,7 +23,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'test = control.sim.0703:main',
+            'test = control.sim.0706:main',
         ],
     },
 )
