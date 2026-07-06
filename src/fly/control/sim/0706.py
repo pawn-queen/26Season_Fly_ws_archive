@@ -1986,7 +1986,7 @@ def main(args=None) -> None:
     parser.add_argument('--max-integral', type=float, default=0.2, # 这个值默认等于 align_maxstep
                         help='PID控制器 - 积分项的最大限制值 (防止积分饱和)。默认: 0.2.')
     
-    parser.add_argument('--tracking-buffer', type=int, default=30, help='Number of frames for tracking history.')
+    parser.add_argument('--tracking-buffer', type=int, default=25, help='Number of frames for tracking history.')
 
     parser.add_argument('--post-drop-delay', type=float, default=1.0,
                         help='每次投放后悬停等待的时间（秒）。')
@@ -2021,14 +2021,14 @@ def main(args=None) -> None:
     # === 新增：为侦察任务添加参数 ===
     parser.add_argument('--recon-search-height', type=float, default=-5.0,
                         help='执行第二次（侦察）视觉搜索时的高度（米）。')
-    parser.add_argument('--recon-search-timeout', type=float, default=5.0,
+    parser.add_argument('--recon-search-timeout', type=float, default=7.0,
                         help='侦察阶段视觉搜索的持续时间（秒）。')
     parser.add_argument('--recon-hover-time', type=float, default=3.0,
                         help='到达每个侦察圆筒上方后的悬停侦察时间（秒）。')
     parser.add_argument('--recon-nav-threshold', type=float, default=0.5,
                         help='判断无人机到达侦察点的误差阈值（米）。')
     
-    parser.add_argument('--recon-forward-distance', type=float, default=6.0,
+    parser.add_argument('--recon-forward-distance', type=float, default=7.0,
                         help='投水完成后，在Offboard模式下向前飞行以到达侦察区的距离（米）。')
     
     

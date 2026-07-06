@@ -216,6 +216,17 @@ class YOLOv5ROS2(Node):
                 continue
 
             cv2.rectangle(display_image, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+            class_name = self.model.names[int(cls)] if hasattr(self.model, "names") else str(int(cls))
+            label = f"{class_name} {conf:.2f}"
+            cv2.putText(
+                display_image,
+                label,
+                (int(x1), max(int(y1) - 8, 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2
+            )
             self.get_logger().info(f"--- [Target {i+1}] (VALID) Debug Info ---")
             self.get_logger().info(f"  Pixel Coords (u,v): ({center_x_pixel}, {center_y_pixel})")
 

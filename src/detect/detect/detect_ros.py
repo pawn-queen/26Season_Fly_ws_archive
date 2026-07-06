@@ -221,8 +221,19 @@ class YOLOv5ROS2(Node):
 
     def show_detections(self, image, detections):
         for det in detections:
-            x1, y1, x2, y2, _, _ = det
+            x1, y1, x2, y2, conf, cls = det
+            class_name = self.model.names[int(cls)] if hasattr(self.model, "names") else str(int(cls))
+            label = f"{class_name} {conf:.2f}"
             cv2.rectangle(image, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+            cv2.putText(
+                image,
+                label,
+                (int(x1), max(int(y1) - 8, 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2
+            )
         cv2.imshow("Detection", image)
         cv2.waitKey(1)
 

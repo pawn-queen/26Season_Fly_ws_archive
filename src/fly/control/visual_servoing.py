@@ -149,7 +149,10 @@ class VisualServoingController:
                     cx = int((box[0] + box[2]) / 2)
                     cy = int((box[1] + box[3]) / 2)
                     current_frame_detections.append({
-                        'id': track_id, 'center': (cx, cy), 'box': box
+                        'id': track_id,
+                        'center': (cx, cy),
+                        'box': box,
+                        'conf': float(conf)
                     })
         self.tracking_history.append(current_frame_detections)
 
@@ -184,7 +187,8 @@ class VisualServoingController:
                     'id': det['id'],
                     'name': name, # 使用动态生成的名称
                     'coords_frd': coords_frd,
-                    'center_pixel': det['center']
+                    'center_pixel': det['center'],
+                    'conf': det['conf']
                 })
 
         # 4. 可视化
@@ -196,9 +200,9 @@ class VisualServoingController:
             color = (0, 255, 0) if is_confirmed else (0, 0, 255)
             box = det['box']
             cv2.rectangle(annotated_frame, (box[0], box[1]), (box[2], box[3]), color, 2)
-            id_text = f"ID: {det['id']}"
+            id_text = f"ID:{det['id']} conf:{det['conf']:.2f}"
             if det['id'] in name_map: id_text += f" ({name_map[det['id']]})"
-            cv2.putText(annotated_frame, id_text, (box[0], box[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.putText(annotated_frame, id_text, (box[0], max(box[1] - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             
         cv2.putText(annotated_frame, f"Confirmed Targets: {len(confirmed_targets_info)}", 
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
