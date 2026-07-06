@@ -20,12 +20,14 @@ import os
 import csv
 import argparse # <<< 新增
 import sys      # <<< 新增
+import traceback
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from rclpy.qos import qos_profile_sensor_data
-from ament_index_python.packages import get_package_share_directory
+from rclpy.executors import ExternalShutdownException, ShutdownException, SingleThreadedExecutor
+from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
 
 
 class DroppingState(Enum):
@@ -1858,6 +1860,31 @@ class OffboardControl(Node):
             self.get_logger().info(f"视觉循环花费时间：{elasped_timer_time:.5f}")
 
 
+def spin_control_node_safely(node: Node) -> None:
+    """
+    Keep the control node alive when a timer/subscription callback raises.
+    Normal shutdown paths still leave the loop so resources can be cleaned up.
+    """
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+
+    try:
+        while rclpy.ok():
+            try:
+                executor.spin_once(timeout_sec=0.1)
+            except (KeyboardInterrupt, ExternalShutdownException, ShutdownException):
+                raise
+            except Exception as e:
+                node.get_logger().error(
+                    "控制回调发生异常，已拦截并继续运行，避免控制节点被关闭："
+                    f"{e}\n{traceback.format_exc()}",
+                    throttle_duration_sec=2.0,
+                )
+    finally:
+        executor.remove_node(node)
+        executor.shutdown()
+
+
 def main(args=None) -> None:
     print('Starting offboard control node...')
     rclpy.init(args=args)
@@ -1875,12 +1902,12 @@ def main(args=None) -> None:
         
         # 检查文件是否存在，不存在则使用备用路径
         if not os.path.exists(default_weights_path):
-            self.get_logger().warn(f"Default weights file not found at {default_weights_path}")
+            print(f"警告：默认模型文件不存在: {default_weights_path}")
             # 可以设置为空字符串或其他默认值
             default_weights_path = ""
             
     except PackageNotFoundError:
-        self.get_logger().error(f"Package {pkg_name} not found")
+        print(f"错误：找不到 ROS2 包 {pkg_name}")
         default_weights_path = ""
 
     
@@ -2079,16 +2106,20 @@ def main(args=None) -> None:
     print('Starting offboard control node with custom parameters...')
     
     # 4. 将解析后的参数传入节点
-    offboard_control = OffboardControl(args=custom_args)
-
+    offboard_control = None
     try:
-        rclpy.spin(offboard_control)
+        offboard_control = OffboardControl(args=custom_args)
+        spin_control_node_safely(offboard_control)
     except KeyboardInterrupt:
         print("程序被用户中断 (Ctrl+C)")
+    except (ExternalShutdownException, ShutdownException):
+        print("ROS上下文已关闭，准备清理控制节点。")
     finally:
         # 确保节点在退出时被正确销毁，从而触发我们的清理逻辑
-        offboard_control.destroy_node()
-        rclpy.shutdown()
+        if offboard_control is not None:
+            offboard_control.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     try:
