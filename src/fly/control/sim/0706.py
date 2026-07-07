@@ -1898,7 +1898,7 @@ def main(args=None) -> None:
         pkg_share_dir = get_package_share_directory(pkg_name)
         
         # 假设你的pt文件在包的根目录
-        default_weights_path = os.path.join(pkg_share_dir, 'models', 'best_sim.pt')
+        default_weights_path = os.path.join(pkg_share_dir, 'models', 'best_sim_211743_barrel.pt')
         
         # 检查文件是否存在，不存在则使用备用路径
         if not os.path.exists(default_weights_path):
@@ -1926,9 +1926,9 @@ def main(args=None) -> None:
     parser.add_argument('--descent-height', type=float, default=0.8,
                         help='Descent height after first alignment in meters (positive value).')
     
-    parser.add_argument('--forward-x', type=float, default=2.5,
+    parser.add_argument('--forward-x', type=float, default=3,
                         help='Forward distance to fly to the drop area in meters.')
-    parser.add_argument('--search-height', type=float, default=-4.0,
+    parser.add_argument('--search-height', type=float, default=-4.5,
                         help='Global search height in meters (negative value for altitude).')
    
     parser.add_argument('--align-maxstep', type=float, default=0.2,
