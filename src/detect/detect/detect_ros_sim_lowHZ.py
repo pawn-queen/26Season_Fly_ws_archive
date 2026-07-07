@@ -8,14 +8,16 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 import message_filters
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import Point
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, String
 from cv_bridge import CvBridge
 import torch
 import cv2
 import numpy as np
 from ultralytics import YOLO
+import csv
 import os
-from ament_index_python.packages import get_package_share_directory
+import time
+from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
 
 class YOLOv5ROS2(Node):
     def __init__(self): # <<< MODIFIED:  def init -> def __init__ (这是Python类的标准构造函数名)
@@ -28,7 +30,7 @@ class YOLOv5ROS2(Node):
             pkg_share_dir = get_package_share_directory(pkg_name)
             
             # 假设你的pt文件在包的根目录
-            default_weights_path = os.path.join(pkg_share_dir, 'models', 'best_sim.pt')
+            default_weights_path = os.path.join(pkg_share_dir, 'models', 'best_sim_163024_findtop.pt')
             
             # 检查文件是否存在，不存在则使用备用路径
             if not os.path.exists(default_weights_path):
@@ -48,9 +50,13 @@ class YOLOv5ROS2(Node):
         self.declare_parameter('record_rgb_video', False)
         self.declare_parameter('video_output_path', '/home/depth_videos')
         self.declare_parameter('roi_scale', 0.5)
+        self.declare_parameter('enable_detection_log', True)
+        self.declare_parameter('detection_log_dir', '~/flylogs/detection_eval')
 
         # --- 获取参数 ---
         weights_path = self.get_parameter('weights_path').get_parameter_value().string_value
+        self.weights_path = weights_path
+        self.model_name = os.path.basename(weights_path) if weights_path else 'unknown_model'
         self.conf_threshold = self.get_parameter('conf_threshold').get_parameter_value().double_value
         color_topic = self.get_parameter('color_topic').get_parameter_value().string_value
         depth_topic = self.get_parameter('depth_topic').get_parameter_value().string_value
@@ -58,6 +64,10 @@ class YOLOv5ROS2(Node):
         self.record_rgb = self.get_parameter('record_rgb_video').get_parameter_value().bool_value
         self.video_path = self.get_parameter('video_output_path').get_parameter_value().string_value
         self.roi_scale = self.get_parameter('roi_scale').get_parameter_value().double_value
+        self.enable_detection_log = self.get_parameter('enable_detection_log').get_parameter_value().bool_value
+        self.detection_log_dir = os.path.expanduser(
+            self.get_parameter('detection_log_dir').get_parameter_value().string_value
+        )
         if not (0.0 < self.roi_scale <= 1.0):
             self.get_logger().warn("roi_scale must be between 0 and 1. Defaulting to 0.5")
             self.roi_scale = 0.5
@@ -74,13 +84,42 @@ class YOLOv5ROS2(Node):
         self.cx = 320.0
         self.cy = 240.0
         self.intrinsics_received = True
+        self.current_mission_state = 'UNKNOWN'
+        self.current_mission_phase = 'UNKNOWN'
 
         # --- 发布者 ---
         self.publisher = self.create_publisher(Point, '/target_position', qos_profile_target)
         self.centerHeight_Pub = self.create_publisher(Float32, '/current_height', 10)
+        self.mission_state_subscriber = self.create_subscription(
+            String,
+            '/mission_state',
+            self.mission_state_callback,
+            10
+        )
 
         # --- 模型加载 ---
         self.model = YOLO(weights_path)
+        self.frame_index = 0
+        self.detection_log_file = None
+        self.detection_log_writer = None
+        if self.enable_detection_log:
+            os.makedirs(self.detection_log_dir, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            model_stem = os.path.splitext(self.model_name)[0].replace(' ', '_')
+            self.detection_log_path = os.path.join(
+                self.detection_log_dir,
+                f"detection_eval_{timestamp}_{model_stem}.csv"
+            )
+            self.detection_log_file = open(self.detection_log_path, 'w', newline='', encoding='utf-8')
+            self.detection_log_writer = csv.writer(self.detection_log_file)
+            self.detection_log_writer.writerow([
+                'timestamp_sec', 'frame_index', 'mission_state', 'mission_phase',
+                'model_name', 'weights_path', 'conf_threshold', 'roi_scale', 'detections_in_frame',
+                'target_index', 'class_id', 'class_name', 'confidence',
+                'x1', 'y1', 'x2', 'y2', 'center_x', 'center_y',
+                'in_roi', 'depth_m', 'world_x', 'world_y', 'world_z', 'published'
+            ])
+            self.get_logger().info(f"Detection evaluation log: {self.detection_log_path}")
 
         # --- OpenCV 桥接 ---
         self.bridge = CvBridge()
@@ -123,8 +162,27 @@ class YOLOv5ROS2(Node):
             self.get_logger().info("Video writer released.")
         else:
             self.get_logger().warn("Video writer was not initialized, no video to save.")
+        if self.detection_log_file is not None and not self.detection_log_file.closed:
+            self.detection_log_file.close()
+            self.get_logger().info("Detection evaluation log closed.")
         cv2.destroyAllWindows()
         super().destroy_node()
+
+    def write_detection_log(self, row):
+        if self.detection_log_writer is None:
+            return
+        self.detection_log_writer.writerow(row)
+        self.detection_log_file.flush()
+
+    def mission_state_callback(self, msg):
+        state_text = msg.data.strip()
+        if '|' in state_text:
+            mission_state, mission_phase = state_text.split('|', 1)
+            self.current_mission_state = mission_state.strip() or 'UNKNOWN'
+            self.current_mission_phase = mission_phase.strip() or 'UNKNOWN'
+        else:
+            self.current_mission_state = state_text or 'UNKNOWN'
+            self.current_mission_phase = state_text or 'UNKNOWN'
 
     def camera_info_callback(self, msg):
         # ... (此部分代码不变)
@@ -165,6 +223,8 @@ class YOLOv5ROS2(Node):
         
     def process_images(self, color_image, depth_image):
         # ... (此方法内的所有代码都不需要改变)
+        self.frame_index += 1
+        frame_time = self.get_clock().now().nanoseconds / 1e9
         if self.record_rgb and not self.is_recording:
             try:
                 filename = self.get_unique_filename()
@@ -205,18 +265,35 @@ class YOLOv5ROS2(Node):
         cv2.rectangle(display_image, (roi_x1, roi_y1), (roi_x2, roi_y2), (255, 0, 0), 2)
         
         results = self.detect_objects(color_image)
+        detections_in_frame = len(results)
+        if detections_in_frame == 0:
+            self.write_detection_log([
+                f"{frame_time:.6f}", self.frame_index,
+                self.current_mission_state, self.current_mission_phase,
+                self.model_name, self.weights_path, self.conf_threshold, self.roi_scale, 0,
+                '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', False
+            ])
         
         for i, result in enumerate(results):
             x1, y1, x2, y2, conf, cls = result
             center_x_pixel = int((x1 + x2) / 2)
             center_y_pixel = int((y1 + y2) / 2)
+            class_name = self.model.names[int(cls)] if hasattr(self.model, "names") else str(int(cls))
+            in_roi = roi_x1 <= center_x_pixel <= roi_x2 and roi_y1 <= center_y_pixel <= roi_y2
 
-            if not (roi_x1 <= center_x_pixel <= roi_x2 and roi_y1 <= center_y_pixel <= roi_y2):
+            if not in_roi:
                 self.get_logger().info(f"[Target {i+1}] is outside ROI, skipping.")
+                self.write_detection_log([
+                    f"{frame_time:.6f}", self.frame_index,
+                    self.current_mission_state, self.current_mission_phase,
+                    self.model_name, self.weights_path, self.conf_threshold, self.roi_scale, detections_in_frame,
+                    i + 1, int(cls), class_name, f"{conf:.6f}",
+                    f"{x1:.2f}", f"{y1:.2f}", f"{x2:.2f}", f"{y2:.2f}",
+                    center_x_pixel, center_y_pixel, False, '', '', '', '', False
+                ])
                 continue
 
             cv2.rectangle(display_image, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-            class_name = self.model.names[int(cls)] if hasattr(self.model, "names") else str(int(cls))
             label = f"{class_name} {conf:.2f}"
             cv2.putText(
                 display_image,
@@ -233,12 +310,27 @@ class YOLOv5ROS2(Node):
             depth = self.get_robust_depth(depth_image, center_x_pixel, center_y_pixel)
             self.get_logger().info(f"  Calculated Depth (Z): {depth:.3f} meters")
 
+            X = Y = Z = ''
+            published = False
             if depth > 0:
                 X, Y, Z = self.pixel_to_world(center_x_pixel, center_y_pixel, depth)
                 self.get_logger().info(f"  World Coords (X,Y,Z): ({X:.3f}, {Y:.3f}, {Z:.3f})")
                 self.process_and_publish(X, Y, Z)
+                published = True
             else:
                 self.get_logger().warn(f"  [Target {i+1}] Invalid depth (0), skipping.")
+            self.write_detection_log([
+                f"{frame_time:.6f}", self.frame_index,
+                self.current_mission_state, self.current_mission_phase,
+                self.model_name, self.weights_path, self.conf_threshold, self.roi_scale, detections_in_frame,
+                i + 1, int(cls), class_name, f"{conf:.6f}",
+                f"{x1:.2f}", f"{y1:.2f}", f"{x2:.2f}", f"{y2:.2f}",
+                center_x_pixel, center_y_pixel, True, f"{depth:.6f}",
+                f"{X:.6f}" if published else '',
+                f"{Y:.6f}" if published else '',
+                f"{Z:.6f}" if published else '',
+                published
+            ])
             self.get_logger().info(f"--------------------------")
 
         if self.show_image:

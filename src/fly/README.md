@@ -6,6 +6,6 @@
 ```bash
 ros2 run control test
 ```
-在`colcon build`之后，在工作空间根目录运行以上代码即可运行`0706.py`<br>
+在`colcon build`之后，在工作空间根目录运行以上代码即可运行`0707.py`<br>
 在`setup.py`中，设置的程序入口名称为`test`,你可以自行更改。<br>
 程序运行的是视觉模型文件是`models`下的`best_sim.pt`,这是yolov8适用于仿真环境的模型，后续如果有需要可自行训练其他。<br>

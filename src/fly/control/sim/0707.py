@@ -5,7 +5,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition, VehicleStatus, VehicleOdometry, VehicleLandDetected
 from geometry_msgs.msg import Point
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, String
 from collections import deque
 import time
 from control.DronePositionChecker import DronePositionChecker
@@ -59,6 +59,22 @@ class MissionState(Enum):
     RTL_ACTIVE = 16
     DONE = 17
 
+MISSION_STATE_DESCRIPTIONS = {
+    MissionState.START: "等待进入任务",
+    MissionState.TAKING_OFF: "起飞阶段",
+    MissionState.GLOBAL_SEARCH: "投放目标全局搜索",
+    MissionState.TARGETING_CYCLE: "投放目标导航/对准",
+    MissionState.TIMEOUT_DROP: "投放超时强制投放",
+    MissionState.TRANSIT_TO_RECON_OFFBOARD: "准备进入侦察搜索",
+    MissionState.RETURN_TO_CENTER_DROPAREA: "返回投放区中心",
+    MissionState.RECON_SEARCH: "侦察搜索/建图",
+    MissionState.RECON_CYCLE: "侦察目标巡航",
+    MissionState.MISSION_COMPLETE: "任务阶段完成",
+    MissionState.REQUEST_RTL: "请求返航",
+    MissionState.RTL_ACTIVE: "返航中",
+    MissionState.DONE: "任务结束",
+}
+
 class OffboardControl(Node):
     """Node for controlling a vehicle in offboard mode."""
 
@@ -86,6 +102,7 @@ class OffboardControl(Node):
             TrajectorySetpoint, '/fmu/in/trajectory_setpoint', qos_profile)
         self.vehicle_command_publisher = self.create_publisher(
             VehicleCommand, '/fmu/in/vehicle_command', qos_profile)
+        self.mission_state_publisher = self.create_publisher(String, '/mission_state', 10)
 
         # Create subscribers
         self.vehicle_local_position_subscriber = self.create_subscription(
@@ -194,6 +211,7 @@ class OffboardControl(Node):
 
         # === 新增：任务流程管理变量 ===
         self.mission_state = MissionState.START
+        self.mission_state_timer = self.create_timer(0.2, self.publish_mission_state)
         self.target_priority = args.target_order 
         self.current_target_index = 0
         self.visited_targets_count = 0
@@ -504,6 +522,13 @@ class OffboardControl(Node):
         """Switch to RTL mode."""
         self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_RETURN_TO_LAUNCH)
         self.get_logger().info("Switching to Return-to-Launch (RTL) mode")
+
+    def publish_mission_state(self):
+        """Publish the current high-level mission state for logging/debug tools."""
+        msg = String()
+        description = MISSION_STATE_DESCRIPTIONS.get(self.mission_state, "未知阶段")
+        msg.data = f"{self.mission_state.name}|{description}"
+        self.mission_state_publisher.publish(msg)
 
     def request_rtl_once(self):
         """Request RTL once, then stop owning the flight mode from this node."""
@@ -1898,7 +1923,7 @@ def main(args=None) -> None:
         pkg_share_dir = get_package_share_directory(pkg_name)
         
         # 假设你的pt文件在包的根目录
-        default_weights_path = os.path.join(pkg_share_dir, 'models', 'best_sim_211743_barrel.pt')
+        default_weights_path = os.path.join(pkg_share_dir, 'models', 'best_sim_163024_findtop.pt')
         
         # 检查文件是否存在，不存在则使用备用路径
         if not os.path.exists(default_weights_path):
