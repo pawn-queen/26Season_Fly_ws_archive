@@ -1923,7 +1923,7 @@ def main(args=None) -> None:
         pkg_share_dir = get_package_share_directory(pkg_name)
         
         # 假设你的pt文件在包的根目录
-        default_weights_path = os.path.join(pkg_share_dir, 'models', 'best_sim_163024_findtop.pt')
+        default_weights_path = os.path.join(pkg_share_dir, 'models', 'sim_white_cylinder_detection_prime_anchor.pt')
         
         # 检查文件是否存在，不存在则使用备用路径
         if not os.path.exists(default_weights_path):

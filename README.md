@@ -59,8 +59,14 @@ ros2 run control test
 4. `detect` 视觉检测节点；
 5. `control` 飞控任务节点。
 
-默认启动：
+更换模型后重新编译：
+```bash
+cd /home/queen/uav/26Season_Fly_ws_archive
+colcon build --packages-select control detect
+source install/setup.bash
+```
 
+默认启动：
 ```bash
 ./scripts/sim_stack.sh start
 ```
