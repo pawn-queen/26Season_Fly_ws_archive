@@ -96,36 +96,54 @@ class VisualServoingController:
 
 
     ### --- 新增: 核心计算方法 --- ###
-    def _pixel_to_world_frd(self, pixel_coord_uv, drone_altitude_z):
+    def _pixel_to_world_frd(self, pixel_coord_uv, drone_altitude_z, roll: float = 0.0, pitch: float = 0.0):
         """
-        将单个像素点坐标，根据无人机高度，转换为无人机机体坐标系(FRD)下的坐标。
-        假定相机垂直朝下安装。
+        将单个像素点坐标，根据无人机高度和姿态，转换为水平FRD坐标。
 
         :param pixel_coord_uv: (u, v) 像素坐标 (图像的列, 图像的行)。
         :param drone_altitude_z: 无人机的Z轴高度 (NED坐标系, 负数表示在空中)。
-        :return: (x, y) 在无人机FRD坐标系下的坐标 (米)。
+        :param roll: 机体横滚角，弧度。
+        :param pitch: 机体俯仰角，弧度。
+        :return: (x, y) 在无人机水平FRD坐标系下的坐标 (米)。
         """
         u_pixel, v_pixel = pixel_coord_uv
-        
+
         # 注意输入格式需要是 (1, 1, 2)
         pixel_point_distorted = np.array([[[u_pixel, v_pixel]]], dtype=np.float32)
         # undistortPoints 返回的是归一化坐标
         x_norm, y_norm = cv2.undistortPoints(
             pixel_point_distorted, self.camera_matrix, self.dist_coeffs
         )[0][0]
-        
-        # 2. 利用相似三角形原理，从归一化平面投影到地面
+
+        # 相机坐标转为机体FRD视线：相机X->右，Y->后，Z->下
+        ray_body = np.array([-y_norm, x_norm, 1.0], dtype=float)
+
+        # 机体FRD转到去除yaw后的水平FRD，用于和水平地面求交。
+        cr, sr = math.cos(roll), math.sin(roll)
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        r_roll = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, cr, -sr],
+            [0.0, sr, cr]
+        ])
+        r_pitch = np.array([
+            [cp, 0.0, sp],
+            [0.0, 1.0, 0.0],
+            [-sp, 0.0, cp]
+        ])
+        ray_level = (r_roll @ r_pitch) @ ray_body
+
         H = -drone_altitude_z
-        Xc = x_norm * H
-        Yc = y_norm * H
+        if H <= 0.0 or abs(ray_level[2]) < 1e-6:
+            return ray_body[0] * H, ray_body[1] * H
 
-        # 3. 将相机坐标转换为无人机FRD坐标
-        x_frd = -Yc
-        y_frd = Xc
+        scale = H / ray_level[2]
+        ground_point_level = ray_level * scale
 
-        return x_frd, y_frd
+        return ground_point_level[0], ground_point_level[1]
 
-    def process_frame(self, frame, drone_altitude_z: float, max_targets_to_confirm: int=3):
+    def process_frame(self, frame, drone_altitude_z: float, max_targets_to_confirm: int=3,
+                      roll: float = 0.0, pitch: float = 0.0):
         """处理单帧图像，进行跟踪、确认、命名和建图。"""
         if not self.is_model_loaded:
             return [], frame
@@ -165,16 +183,27 @@ class VisualServoingController:
         # 这个列表将包含所有视觉信息，供主控程序使用
         confirmed_targets_info = []
         if most_common_ids:
-            confirmed_detections_this_frame = []
-            for det in current_frame_detections:
-                if det['id'] in most_common_ids:
-                    confirmed_detections_this_frame.append(det)
-            
-            confirmed_detections_this_frame.sort(key=lambda d: d['center'][0])
-            
+            stable_detections = []
+            for track_id in most_common_ids:
+                centers = [
+                    det['center']
+                    for frame_dets in self.tracking_history
+                    for det in frame_dets
+                    if det['id'] == track_id
+                ]
+                if not centers:
+                    continue
+                center = np.median(np.array(centers, dtype=float), axis=0)
+                stable_detections.append({
+                    'id': track_id,
+                    'center': (int(center[0]), int(center[1]))
+                })
+
+            stable_detections.sort(key=lambda d: d['center'][0])
+
             # target_names = ["Left", "Middle", "Right"]
-            
-            for i, det in enumerate(confirmed_detections_this_frame):
+
+            for i, det in enumerate(stable_detections):
                 drop_target_names = ["Left", "Middle", "Right"]
                 if i < len(drop_target_names):
                     name = drop_target_names[i]
@@ -182,7 +211,7 @@ class VisualServoingController:
                     # 为额外的侦察目标生成通用名称
                     name = f"Recon_{i+1}"
 
-                coords_frd = self._pixel_to_world_frd(det['center'], drone_altitude_z)
+                coords_frd = self._pixel_to_world_frd(det['center'], drone_altitude_z, roll, pitch)
                 confirmed_targets_info.append({
                     'id': det['id'],
                     'name': name, # 使用动态生成的名称
