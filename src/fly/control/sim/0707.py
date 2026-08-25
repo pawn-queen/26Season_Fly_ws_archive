@@ -345,6 +345,8 @@ class OffboardControl(Node):
         
         ### 新增: 用于稳定建图的数据收集变量 ###
         self.map_data_collection = []  # 存储多帧的坐标地图
+        # 全局搜索阶段中，按世界 NED 坐标保存每个目标的多帧平均结果。
+        self.world_target_coordinates_ned = {}
 
         #==================投水状态机=================
         self.servo_step_delay = args.servo_step_delay  # 每个舵机动作之间的延迟（秒），可以根据实际情况调整
@@ -854,6 +856,23 @@ class OffboardControl(Node):
         y_target = x*math.sin(self.init_yaw)+y*math.cos(self.init_yaw) + self.initial_y
 
         return x_target, y_target
+
+    def coordinate_current_FRD2NED(self, x, y, origin_x=None, origin_y=None, yaw=None):
+        """将当前机体 FRD 平面坐标转换为世界 NED 坐标。
+
+        视觉测量值相对于拍摄该帧时的机体；因此平移和旋转都必须使用
+        当前的局部位置与航向，而不是固定使用起飞点或投放区的位置。
+        """
+        if origin_x is None:
+            origin_x = self.vehicle_local_position.x
+        if origin_y is None:
+            origin_y = self.vehicle_local_position.y
+        if yaw is None:
+            yaw = self.vehicle_local_position.heading
+
+        x_target = x * math.cos(yaw) - y * math.sin(yaw) + origin_x
+        y_target = x * math.sin(yaw) + y * math.cos(yaw) + origin_y
+        return x_target, y_target
     
     def reset_for_next_target(self):
         """为下一个目标重置所有相关的状态标志"""
@@ -1247,10 +1266,37 @@ class OffboardControl(Node):
                 self.fly_to_position(self.vehicle_local_position.x, self.vehicle_local_position.y, self.takeoff_target_height)
     
     
+    def _collect_global_search_map_sample(self, vision_info):
+        """将当前视觉帧的投放目标转换为 NED 后写入多帧建图缓存。"""
+        if not vision_info:
+            return
+
+        frame_map = {}
+        sample_x = self.vehicle_local_position.x
+        sample_y = self.vehicle_local_position.y
+        sample_yaw = self.vehicle_local_position.heading
+        for target in vision_info:
+            name = target.get('name')
+            if name in ("Left", "Middle", "Right") and 'coords_frd' in target:
+                x_frd, y_frd = target['coords_frd']
+                frame_map[name] = self.coordinate_current_FRD2NED(
+                    x_frd,
+                    y_frd,
+                    origin_x=sample_x,
+                    origin_y=sample_y,
+                    yaw=sample_yaw,
+                )
+
+        if frame_map:
+            self.map_data_collection.append(frame_map)
+
     def _calculate_and_store_average_map(self):
         """
         计算收集到的多帧地图数据的平均值，并将其存储到最终的NED坐标地图中。
         """
+        self.mission_targets_ned.clear()
+        self.world_target_coordinates_ned.clear()
+
         if not self.map_data_collection:
             self.get_logger().error("无法计算平均地图，因为没有收集到数据。")
             return
@@ -1263,24 +1309,44 @@ class OffboardControl(Node):
         for frame_map in self.map_data_collection:
             for name, coords in frame_map.items():
                 if name in sum_coords:
-                    sum_coords[name][0] += coords[0] # x_frd
-                    sum_coords[name][1] += coords[1] # y_frd
+                    sum_coords[name][0] += coords[0] # x_ned
+                    sum_coords[name][1] += coords[1] # y_ned
                     counts[name] += 1
-        
-        # 计算平均值并转换为NED坐标
+
+        # 计算 NED 世界坐标平均值。
         for name in sum_coords.keys():
             if counts[name] > 0:
-                avg_x_frd = sum_coords[name][0] / counts[name]
-                avg_y_frd = sum_coords[name][1] / counts[name]
-
-                # 转换为相对于无人机初始位置的绝对FRD坐标
-                abs_x_frd = self.forward_x + avg_x_frd
-                abs_y_frd = 0.0 + avg_y_frd
-                
-                # 转换为NED坐标并存储
-                ned_x, ned_y = self.coordinate_FRD2NED(abs_x_frd, abs_y_frd)
+                ned_x = sum_coords[name][0] / counts[name]
+                ned_y = sum_coords[name][1] / counts[name]
                 self.world_target_coordinates_ned[name] = (ned_x, ned_y)
-                self.get_logger().info(f"  -> 平均坐标 '{name}' (FRD): ({avg_x_frd:.2f}, {avg_y_frd:.2f}) -> (NED): ({ned_x:.2f}, {ned_y:.2f})")
+                self.get_logger().info(
+                    f"  -> 平均坐标 '{name}' 使用 {counts[name]} 帧 (NED): "
+                    f"({ned_x:.2f}, {ned_y:.2f})"
+                )
+
+        self.get_logger().info(
+            "全局搜索目标累计样本: "
+            f"Left={counts['Left']} 帧, "
+            f"Middle={counts['Middle']} 帧, "
+            f"Right={counts['Right']} 帧 "
+            f"(有效视觉帧总数={len(self.map_data_collection)}；同一帧可同时计入多个目标)"
+        )
+        self.get_logger().info(f"将按照用户指定的顺序进行打击: {self.target_priority}")
+
+        for target_name in self.target_priority:
+            if target_name in self.world_target_coordinates_ned:
+                self.mission_targets_ned.append({
+                    'name': target_name,
+                    'coords_ned': self.world_target_coordinates_ned[target_name],
+                })
+                ned_x, ned_y = self.world_target_coordinates_ned[target_name]
+                self.get_logger().info(
+                    f"  -> 已规划平均目标 '{target_name}' @ NED({ned_x:.2f}, {ned_y:.2f})"
+                )
+            else:
+                self.get_logger().warn(
+                    f"  -> 用户指定的目标 '{target_name}' 没有足够的平均坐标，将跳过。"
+                )
 
     def _build_final_mission_map(self, named_targets_frd):
         """
@@ -1303,10 +1369,7 @@ class OffboardControl(Node):
                 target_data = vision_map[target_name]
                 x_frd, y_frd = target_data['coords_frd']
                 
-                abs_x_frd = self.forward_x + x_frd
-                abs_y_frd = 0.0 + y_frd
-
-                ned_x, ned_y = self.coordinate_FRD2NED(abs_x_frd, abs_y_frd)
+                ned_x, ned_y = self.coordinate_current_FRD2NED(x_frd, y_frd)
                 
                 self.mission_targets_ned.append({
                     'name': target_name,
@@ -1331,17 +1394,8 @@ class OffboardControl(Node):
         self.get_logger().info("开始构建侦察任务地图...")
         # 侦察任务不需要用户指定顺序，直接按视觉模块返回的顺序（通常是按x轴排序）
         for target_data in named_targets_frd:
-            # 这里我们假设无人机在切换回Offboard后位置变化不大
-            # 一个更鲁棒的方法是记录切换回Offboard时的精确位置
-            current_x, current_y = self.coordinate_NED2FRD(self.vehicle_local_position.x, self.vehicle_local_position.y)
-
             x_frd, y_frd = target_data['coords_frd']
-            
-            # 目标的绝对FRD坐标 = 当前无人机FRD坐标 + 目标相对无人机的FRD坐标
-            abs_x_frd = current_x + x_frd
-            abs_y_frd = current_y + y_frd
-
-            ned_x, ned_y = self.coordinate_FRD2NED(abs_x_frd, abs_y_frd)
+            ned_x, ned_y = self.coordinate_current_FRD2NED(x_frd, y_frd)
             
             self.recon_targets_ned.append({
                 'name': target_data['name'],
@@ -1396,11 +1450,19 @@ class OffboardControl(Node):
         #进入offboard前发布位置控制点
              
         if self.offboard_setpoint_counter < 10:
+            if self.vehicle_status.nav_state == 0 and self.offboard_setpoint_counter == 0:
+                self.get_logger().warn(
+                    "飞控状态尚未收到(nav_state=0)，"
+                    "请确认仿真 PX4、MicroXRCEAgent 和 DDS 桥接正常。"
+                )
             self.publish_position_setpoint(self.vehicle_local_position.x, self.vehicle_local_position.y, self.vehicle_local_position.z)
             self.engage_offboard_mode()  
             # 仅在日志计数满足条件时打印
             if self.log_counter % 10 == 0:
-                self.get_logger().info(f"尝试切入offboard, ==============向前飞行距离{self.forward_x}m===================")
+                self.get_logger().info(
+                    f"尝试切入offboard(第{self.offboard_setpoint_counter + 1}次), "
+                    f"==============向前飞行距离{self.forward_x}m==================="
+                )
 
         if self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD:
 
@@ -1416,8 +1478,6 @@ class OffboardControl(Node):
                 if is_done:
                     self.get_logger().info("第二次投水流程确认完成。")
                     self.Is_Finish_2nd_Drop = True
-                    # 更新任务完成标志
-                    self.is_FinishDrop = True
             
             
             if not self.is_ReadyToTakeoff:
@@ -1472,6 +1532,9 @@ class OffboardControl(Node):
             if self.is_AtDropArea and not self.is_FinishDrop:
                 if self.mission_state == MissionState.START:
                     self.mission_state = MissionState.GLOBAL_SEARCH
+                    self.map_data_collection.clear()
+                    self.world_target_coordinates_ned.clear()
+                    self.mission_targets_ned.clear()
                     self.get_logger().info(f"切换为GLOBAL_SEARCH模式。")
                     return
                 
@@ -1506,8 +1569,8 @@ class OffboardControl(Node):
                     
                     ## 全局搜索到达时间后
                     if elapsed_search_time > self.search_timeout:
-                        self.get_logger().info("搜索时间到，开始根据跟踪历史和用户优先级构建最终任务地图。")
-                        self._build_final_mission_map(self.current_vision_info)
+                        self.get_logger().info("搜索时间到，开始根据多帧平均结果和用户优先级构建最终任务地图。")
+                        self._calculate_and_store_average_map()
                         
                         if not self.mission_targets_ned:
                             self.get_logger().error("搜索结束但未规划任何有效目标！进入超时投放。")
@@ -1868,12 +1931,16 @@ class OffboardControl(Node):
         vision_info, annotated_frame = self.vision_controller.process_frame(
             frame_to_process, 
             current_altitude,
-            max_targets_to_confirm=num_targets_for_vision # <<< 将决策结果传入
+            max_targets_to_confirm=num_targets_for_vision, # <<< 将决策结果传入
+            roll=self.vehicle_roll,
+            pitch=self.vehicle_pitch,
         )
 
         # 只有在进行有效处理时才更新视觉信息
         if num_targets_for_vision > 0:
             self.latest_vision_info = vision_info
+            if self.mission_state == MissionState.GLOBAL_SEARCH:
+                self._collect_global_search_map_sample(vision_info)
         
         # 更新用于显示的 annotated_frame (无论是否处理都更新，以便显示状态)
         cv2.putText(annotated_frame, f"State: {self.mission_state.name}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
@@ -1923,7 +1990,7 @@ def main(args=None) -> None:
         pkg_share_dir = get_package_share_directory(pkg_name)
         
         # 假设你的pt文件在包的根目录
-        default_weights_path = os.path.join(pkg_share_dir, 'models', 'sim_white_cylinder_detection_prime_anchor.pt')
+        default_weights_path = os.path.join(pkg_share_dir, 'models', '26n_0807_bright_needle.pt')
         
         # 检查文件是否存在，不存在则使用备用路径
         if not os.path.exists(default_weights_path):

@@ -167,12 +167,10 @@ class VisualServoingController:
                     cx = int((box[0] + box[2]) / 2)
                     cy = int((box[1] + box[3]) / 2)
                     current_frame_detections.append({
-                        'id': track_id,
-                        'center': (cx, cy),
-                        'box': box,
-                        'conf': float(conf)
+                        'id': track_id, 'center': (cx, cy), 'box': box
                     })
         self.tracking_history.append(current_frame_detections)
+        current_detections_by_id = {det['id']: det for det in current_frame_detections}
 
         # 2. 分析历史，找出最稳定的ID
         all_ids_in_history = [det['id'] for frame_dets in self.tracking_history for det in frame_dets]
@@ -211,17 +209,26 @@ class VisualServoingController:
                     # 为额外的侦察目标生成通用名称
                     name = f"Recon_{i+1}"
 
-                coords_frd = self._pixel_to_world_frd(det['center'], drone_altitude_z, roll, pitch)
+                # 历史帧只用于确认稳定目标；空间坐标必须使用当前图像中的
+                # 像素点，才能与本帧的高度、姿态和飞机位置严格对应。
+                current_det = current_detections_by_id.get(det['id'])
+                if current_det is None:
+                    continue
+
+                coords_frd = self._pixel_to_world_frd(
+                    current_det['center'], drone_altitude_z, roll, pitch
+                )
                 confirmed_targets_info.append({
                     'id': det['id'],
                     'name': name, # 使用动态生成的名称
                     'coords_frd': coords_frd,
-                    'center_pixel': det['center'],
-                    'conf': det['conf']
+                    'center_pixel': current_det['center'],
+                    'stable_center_pixel': det['center']
                 })
 
         # 4. 可视化
         annotated_frame = frame.copy()
+        video_frame = frame.copy()  # 用于视频录制的原始帧
         name_map = {tgt['id']: tgt['name'] for tgt in confirmed_targets_info}
 
         for det in current_frame_detections:
@@ -229,11 +236,11 @@ class VisualServoingController:
             color = (0, 255, 0) if is_confirmed else (0, 0, 255)
             box = det['box']
             cv2.rectangle(annotated_frame, (box[0], box[1]), (box[2], box[3]), color, 2)
-            id_text = f"ID:{det['id']} conf:{det['conf']:.2f}"
+            id_text = f"ID: {det['id']}"
             if det['id'] in name_map: id_text += f" ({name_map[det['id']]})"
-            cv2.putText(annotated_frame, id_text, (box[0], max(box[1] - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            
-        cv2.putText(annotated_frame, f"Confirmed Targets: {len(confirmed_targets_info)}", 
+            cv2.putText(annotated_frame, id_text, (box[0], box[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        cv2.putText(annotated_frame, f"Confirmed Targets: {len(confirmed_targets_info)}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
         # 5. 实现视频和拍照功能
@@ -242,8 +249,7 @@ class VisualServoingController:
                 height, width = annotated_frame.shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*'XVID')
                 self.video_writer = cv2.VideoWriter(self.video_full_path, fourcc, self.video_fps, (width, height))
-            # 修正：将标注后的帧写入视频
-            self.video_writer.write(annotated_frame)
+            self.video_writer.write(video_frame)
 
         if self.enable_photo_capture and self.frame_counter % self.photo_capture_interval == 0:
             timestamp = time.strftime("%H%M%S")
