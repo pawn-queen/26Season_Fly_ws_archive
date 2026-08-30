@@ -25,7 +25,11 @@ class VisualServoingController:
                  enable_video_recording: bool = False,
                  video_save_path: str = '/tmp/drone_videos',
                  video_filename: str = 'output.avi',
-                 video_fps: float = 30.0):
+                 video_fps: float = 30.0,
+                 camera_to_body_rotation=None,
+                 camera_position_in_body=None,
+                 min_ground_ray_down: float = 0.15,
+                 max_ground_range_m: float = 30.0):
         """
         初始化视觉控制器。
         ### 新增参数:
@@ -46,6 +50,36 @@ class VisualServoingController:
         self.cy = self.camera_matrix[1, 2]
         print("视觉控制器：相机内参已加载。")
         ### ---------------------- ###
+
+        # 广角相机外参，机体系采用 FRD（前、右、下）。默认值保持此前的
+        # "相机 X -> 右、相机 Y -> 后、相机 Z -> 下" 安装假设和零平移。
+        default_camera_to_body_rotation = np.array([
+            [0.0, -1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0]
+        ])
+        self.camera_to_body_rotation = np.asarray(
+            camera_to_body_rotation
+            if camera_to_body_rotation is not None
+            else default_camera_to_body_rotation,
+            dtype=float
+        )
+        self.camera_position_in_body = np.asarray(
+            camera_position_in_body
+            if camera_position_in_body is not None
+            else np.zeros(3),
+            dtype=float
+        )
+        if self.camera_to_body_rotation.shape != (3, 3):
+            raise ValueError("camera_to_body_rotation must have shape (3, 3)")
+        if self.camera_position_in_body.shape != (3,):
+            raise ValueError("camera_position_in_body must have shape (3,)")
+        if not 0.0 < min_ground_ray_down < 1.0:
+            raise ValueError("min_ground_ray_down must be in (0, 1)")
+        if max_ground_range_m <= 0.0:
+            raise ValueError("max_ground_range_m must be positive")
+        self.min_ground_ray_down = float(min_ground_ray_down)
+        self.max_ground_range_m = float(max_ground_range_m)
 
         self.CONFIDENCE_THRESHOLD = confidence_threshold
         
@@ -104,7 +138,7 @@ class VisualServoingController:
         :param drone_altitude_z: 无人机的Z轴高度 (NED坐标系, 负数表示在空中)。
         :param roll: 机体横滚角，弧度。
         :param pitch: 机体俯仰角，弧度。
-        :return: (x, y) 在无人机水平FRD坐标系下的坐标 (米)。
+        :return: (x, y) 在无人机水平FRD坐标系下的坐标 (米)，无法可靠求交时返回 None。
         """
         u_pixel, v_pixel = pixel_coord_uv
 
@@ -115,8 +149,9 @@ class VisualServoingController:
             pixel_point_distorted, self.camera_matrix, self.dist_coeffs
         )[0][0]
 
-        # 相机坐标转为机体FRD视线：相机X->右，Y->后，Z->下
-        ray_body = np.array([-y_norm, x_norm, 1.0], dtype=float)
+        # 相机坐标中的光线先由外参旋转到机体 FRD。
+        ray_camera = np.array([x_norm, y_norm, 1.0], dtype=float)
+        ray_body = self.camera_to_body_rotation @ ray_camera
 
         # 机体FRD转到去除yaw后的水平FRD，用于和水平地面求交。
         cr, sr = math.cos(roll), math.sin(roll)
@@ -131,16 +166,33 @@ class VisualServoingController:
             [0.0, 1.0, 0.0],
             [-sp, 0.0, cp]
         ])
-        ray_level = (r_roll @ r_pitch) @ ray_body
+        # Vehicle attitude is Rz(yaw) @ Ry(pitch) @ Rx(roll). Removing yaw
+        # must preserve the same Rx-then-Ry application order for vectors.
+        body_to_level_rotation = r_pitch @ r_roll
+        ray_level = body_to_level_rotation @ ray_body
+        camera_position_level = body_to_level_rotation @ self.camera_position_in_body
 
-        H = -drone_altitude_z
-        if H <= 0.0 or abs(ray_level[2]) < 1e-6:
-            return ray_body[0] * H, ray_body[1] * H
+        ray_norm = np.linalg.norm(ray_level)
+        if not math.isfinite(ray_norm) or ray_norm < 1e-6:
+            return None
+        ray_level = ray_level / ray_norm
+
+        # 地面是 level-FRD 的 z=0 平面。相机而非机体原点必须参与求交。
+        H = -drone_altitude_z - camera_position_level[2]
+        # Near-horizontal and upward rays make the ground intersection too
+        # sensitive to small errors in height, attitude and pixel location.
+        if H <= 0.0 or ray_level[2] <= self.min_ground_ray_down:
+            return None
 
         scale = H / ray_level[2]
-        ground_point_level = ray_level * scale
+        ground_point_level = camera_position_level + ray_level * scale
 
-        return ground_point_level[0], ground_point_level[1]
+        if not np.all(np.isfinite(ground_point_level)):
+            return None
+        if math.hypot(ground_point_level[0], ground_point_level[1]) > self.max_ground_range_m:
+            return None
+
+        return float(ground_point_level[0]), float(ground_point_level[1])
 
     def process_frame(self, frame, drone_altitude_z: float, max_targets_to_confirm: int=3,
                       roll: float = 0.0, pitch: float = 0.0):
@@ -209,8 +261,6 @@ class VisualServoingController:
                     # 为额外的侦察目标生成通用名称
                     name = f"Recon_{i+1}"
 
-                # 历史帧只用于确认稳定目标；空间坐标必须使用当前图像中的
-                # 像素点，才能与本帧的高度、姿态和飞机位置严格对应。
                 current_det = current_detections_by_id.get(det['id'])
                 if current_det is None:
                     continue
@@ -218,6 +268,8 @@ class VisualServoingController:
                 coords_frd = self._pixel_to_world_frd(
                     current_det['center'], drone_altitude_z, roll, pitch
                 )
+                if coords_frd is None:
+                    continue
                 confirmed_targets_info.append({
                     'id': det['id'],
                     'name': name, # 使用动态生成的名称

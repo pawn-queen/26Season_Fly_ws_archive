@@ -102,6 +102,21 @@ DETECT_ARGS="-p weights_path:=/abs/path/model.pt" ./scripts/sim_stack.sh restart
 CONTROL_ARGS="--recon-search-timeout 12" ./scripts/sim_stack.sh start
 ```
 
+### 仿真投水落点判定
+
+`sim/0707.py` 已把两阶段视觉对准与投放结果串成闭环：全局搜索会使用广角相机外参、拍摄时的飞行器位姿和稳健离群值过滤建立 NED 目标地图；每次实际发送舵机投放指令时，节点会以该瞬间的深度相机目标、投放器位置和 PX4 NED 速度计算虚拟载荷的运动学落点。
+
+Gazebo 的 `x500_depth` 没有水体释放/飞溅碰撞传感器，因此该判定是**确定性的弹道评估**，并不模拟流体。结果会发布到 `/simulated_drop_result`，同时写入 `~/flylogs/simulated_drop_eval_<时间>.csv`。其中 `HIT` 表示预测落点到目标中心的水平误差不大于 `hit_radius_m`；`MISS` 与 `NO_FRESH_DEPTH_TARGET` 等状态会保留原因，不能被当作精准命中。
+
+默认命中半径为世界中 1 m 直径桶的 0.5 m。需要固定地面在本地 NED 中的 down 坐标，或调整装载点/风速模型时，可这样启动：
+
+```bash
+CONTROL_ARGS="--sim-drop-hit-radius 0.5 --sim-drop-ground-z 0.0 --dropper-zoffset 0.15 --sim-drop-wind-north 0.0 --sim-drop-wind-east 0.0" \
+  ./scripts/sim_stack.sh start --control-headless
+```
+
+不设置 `--sim-drop-ground-z` 时，评估会使用释放瞬间的深度目标 down 坐标作撞击平面，可避免假设 PX4 本地原点正好等于地面。可用 `--no-simulated-drop-evaluation` 关闭该功能；广角相机安装偏差则通过 `--widecam-*-offset` 和 `--widecam-*-deg` 标定。
+
 如果 PX4 或工作空间路径不同，可以覆盖默认路径：
 
 ```bash
