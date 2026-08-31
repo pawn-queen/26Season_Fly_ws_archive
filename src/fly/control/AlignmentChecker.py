@@ -1,49 +1,80 @@
-from collections import deque
-import time
+"""Continuous elapsed-time checker for horizontal target alignment."""
+
 import math
+import time
+
+
 class AlignmentChecker:
-    def __init__(self, logger_func, threshold=0.15, time_window=2.0, check_frequency=10):
+    """Report alignment after the error remains below a threshold."""
+
+    def __init__(
+        self,
+        logger_func,
+        threshold=0.15,
+        time_window=2.0,
+        check_frequency=10,
+        time_func=None,
+    ):
         """
-        :param logger_func: 日志记录函数（例如 Node.get_logger().info）
-        :param threshold: 误差阈值 (米)
-        :param time_window: 时间窗口 (秒)
-        :param check_frequency: 误差检查频率 (每秒次数)
+        Initialize the alignment threshold and continuous time window.
+
+        ``check_frequency`` remains for API compatibility but is no longer used
+        to convert time into a number of callback samples.  ``time_func`` may
+        inject a monotonic or ROS clock for deterministic behaviour.
         """
+        threshold = float(threshold)
+        time_window = float(time_window)
+        if not math.isfinite(threshold) or threshold <= 0.0:
+            raise ValueError("threshold must be positive and finite")
+        if not math.isfinite(time_window) or time_window < 0.0:
+            raise ValueError("time_window must be non-negative and finite")
+
         self.logger_func = logger_func
         self.threshold = threshold
         self.time_window = time_window
         self.check_frequency = check_frequency
-        self.error_deque = deque(maxlen=int(time_window * check_frequency))  # 固定大小的队列
-
+        self._time_func = time_func or time.monotonic
+        self._within_threshold_since = None
+        self._alignment_reported = False
 
     def check(self, current_x, current_y, target_x, target_y):
         """
-        检查当前位置是否与目标持续对准。
-        这个方法是“无状态的”，它只根据历史误差数据返回当前是否满足对准条件。
-        :return: 如果在时间窗口内所有误差都小于阈值，则返回 True，否则返回 False。
+        Check whether error stays below the threshold continuously.
+
+        Return ``True`` once the continuous interval reaches ``time_window``.
         """
-        # 计算当前位置与目标点的误差
-        error = math.sqrt((current_x - target_x)**2 + (current_y - target_y)**2)
+        error = math.hypot(current_x - target_x, current_y - target_y)
+        now = self._time_func()
 
-        # 将误差记录到队列中
-        self.error_deque.append(error)
+        if (
+            not math.isfinite(error)
+            or not math.isfinite(now)
+            or error >= self.threshold
+        ):
+            self._within_threshold_since = None
+            self._alignment_reported = False
+            return False
 
-        # 只有当队列被填满时，才进行判断
-        if len(self.error_deque) == self.error_deque.maxlen:
-            # 检查队列中的所有误差是否都小于阈值
-            if all(e < self.threshold for e in self.error_deque):
-                self.logger_func(f"对准条件满足: 连续 {len(self.error_deque)} 次误差小于阈值 {self.threshold} m。")
-                return True  # 条件满足
+        if (
+            self._within_threshold_since is None
+            or now < self._within_threshold_since
+        ):
+            self._within_threshold_since = now
 
-        # 减少不必要的日志输出，可以只在接近对准或调试时打印
-        # self.logger_func(f"对准检查中... 当前误差: {error:.3f} m, 队列填充: {len(self.error_deque)}/{self.deque_maxlen}")
-        
-        return False # 默认返回 False，表示条件不满足
+        elapsed = now - self._within_threshold_since
+        if elapsed < self.time_window:
+            return False
+
+        if not self._alignment_reported:
+            self.logger_func(
+                f"对准条件满足: 误差连续 {elapsed:.2f} 秒小于阈值 "
+                f"{self.threshold} m。"
+            )
+            self._alignment_reported = True
+        return True
 
     def reset(self):
-        """
-        重置检查器状态，清空历史误差数据。
-        当一个阶段的对准完成后，开始下一阶段前调用。
-        """
-        self.error_deque.clear()
+        """Clear the continuous-alignment timer and reported state."""
+        self._within_threshold_since = None
+        self._alignment_reported = False
         self.logger_func("对准检查器已重置。")

@@ -6,9 +6,9 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 import message_filters
-from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import Point
-from std_msgs.msg import Float32, String
+from sensor_msgs.msg import CameraInfo, ChannelFloat32, Image, PointCloud
+from geometry_msgs.msg import Point, Point32
+from std_msgs.msg import Float32, Header, String
 from cv_bridge import CvBridge
 import torch
 import cv2
@@ -18,6 +18,14 @@ import csv
 import os
 import time
 from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
+from detect.target_selection import (
+    TARGET_OBSERVATION_FRAME_ID,
+    align_depth_to_color,
+    choose_highest_confidence_candidate,
+    depth_scale_for_encoding,
+    image_timestamps_within_skew,
+    source_timestamp_matches_node_clock,
+)
 
 class YOLOv5ROS2(Node):
     def __init__(self): # <<< MODIFIED:  def init -> def __init__ (这是Python类的标准构造函数名)
@@ -46,12 +54,42 @@ class YOLOv5ROS2(Node):
         self.declare_parameter('conf_threshold', 0.4)
         self.declare_parameter('color_topic', '/camera')
         self.declare_parameter('depth_topic', '/depth_camera')
-        self.declare_parameter('show_image', True)
+        self.declare_parameter('show_image', False)
         self.declare_parameter('record_rgb_video', False)
         self.declare_parameter('video_output_path', '/home/depth_videos')
         self.declare_parameter('roi_scale', 0.5)
+        self.declare_parameter('allow_full_frame_reacquisition', True)
+        self.declare_parameter('publish_legacy_target_position', False)
         self.declare_parameter('enable_detection_log', True)
         self.declare_parameter('detection_log_dir', '~/flylogs/detection_eval')
+        self.declare_parameter('max_rgb_depth_skew', 0.04)
+        self.declare_parameter(
+            'color_fx',
+            float(320.0 / np.tan(1.204 / 2.0)),
+        )
+        self.declare_parameter(
+            'color_fy',
+            float(320.0 / np.tan(1.204 / 2.0)),
+        )
+        self.declare_parameter('color_cx', 320.0)
+        self.declare_parameter('color_cy', 240.0)
+        self.declare_parameter(
+            'depth_fx',
+            float(320.0 / np.tan(1.274 / 2.0)),
+        )
+        self.declare_parameter(
+            'depth_fy',
+            float(320.0 / np.tan(1.274 / 2.0)),
+        )
+        self.declare_parameter('depth_cx', 320.0)
+        self.declare_parameter('depth_cy', 240.0)
+        # OakD-Lite SDF: depth origin is 0.1 m ahead of RGB.  With the
+        # downward-facing ROS optical axes this is [0, -0.1, 0] in RGB.
+        # Override these three parameters whenever the simulated model or
+        # calibrated mounting changes.
+        self.declare_parameter('depth_to_color_tx', 0.0)
+        self.declare_parameter('depth_to_color_ty', -0.1)
+        self.declare_parameter('depth_to_color_tz', 0.0)
 
         # --- 获取参数 ---
         weights_path = self.get_parameter('weights_path').get_parameter_value().string_value
@@ -64,10 +102,19 @@ class YOLOv5ROS2(Node):
         self.record_rgb = self.get_parameter('record_rgb_video').get_parameter_value().bool_value
         self.video_path = self.get_parameter('video_output_path').get_parameter_value().string_value
         self.roi_scale = self.get_parameter('roi_scale').get_parameter_value().double_value
+        self.allow_full_frame_reacquisition = self.get_parameter(
+            'allow_full_frame_reacquisition'
+        ).get_parameter_value().bool_value
+        self.publish_legacy_target_position = self.get_parameter(
+            'publish_legacy_target_position'
+        ).get_parameter_value().bool_value
         self.enable_detection_log = self.get_parameter('enable_detection_log').get_parameter_value().bool_value
         self.detection_log_dir = os.path.expanduser(
             self.get_parameter('detection_log_dir').get_parameter_value().string_value
         )
+        self.max_rgb_depth_skew = self.get_parameter(
+            'max_rgb_depth_skew'
+        ).get_parameter_value().double_value
         if not (0.0 < self.roi_scale <= 1.0):
             self.get_logger().warn("roi_scale must be between 0 and 1. Defaulting to 0.5")
             self.roi_scale = 0.5
@@ -78,17 +125,59 @@ class YOLOv5ROS2(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
+        qos_profile_observation = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
         
-        self.fx = 465.7411193847656
-        self.fy = 465.7411766052246
-        self.cx = 320.0
-        self.cy = 240.0
+        self.fx = self.get_parameter('color_fx').value
+        self.fy = self.get_parameter('color_fy').value
+        self.cx = self.get_parameter('color_cx').value
+        self.cy = self.get_parameter('color_cy').value
+        self.depth_intrinsics = (
+            self.get_parameter('depth_fx').value,
+            self.get_parameter('depth_fy').value,
+            self.get_parameter('depth_cx').value,
+            self.get_parameter('depth_cy').value,
+        )
+        self.color_intrinsics = (self.fx, self.fy, self.cx, self.cy)
+        self.depth_to_color_translation = np.array([
+            self.get_parameter('depth_to_color_tx').value,
+            self.get_parameter('depth_to_color_ty').value,
+            self.get_parameter('depth_to_color_tz').value,
+        ], dtype=float)
+        if (
+            not np.isfinite(self.max_rgb_depth_skew)
+            or self.max_rgb_depth_skew <= 0.0
+        ):
+            raise ValueError("max_rgb_depth_skew must be positive")
+        if not all(np.isfinite(value) for value in (
+            *self.color_intrinsics,
+            *self.depth_intrinsics,
+        )):
+            raise ValueError("color/depth intrinsics must be finite")
+        if not all(value > 0.0 for value in (
+            self.fx,
+            self.fy,
+            self.depth_intrinsics[0],
+            self.depth_intrinsics[1],
+        )):
+            raise ValueError("color/depth focal lengths must be positive")
+        if not np.all(np.isfinite(self.depth_to_color_translation)):
+            raise ValueError("depth-to-color translation must be finite")
         self.intrinsics_received = True
         self.current_mission_state = 'UNKNOWN'
         self.current_mission_phase = 'UNKNOWN'
 
         # --- 发布者 ---
         self.publisher = self.create_publisher(Point, '/target_position', qos_profile_target)
+        self.observation_publisher = self.create_publisher(
+            PointCloud,
+            '/target_observation',
+            qos_profile_observation,
+        )
         self.centerHeight_Pub = self.create_publisher(Float32, '/current_height', 10)
         self.mission_state_subscriber = self.create_subscription(
             String,
@@ -128,7 +217,9 @@ class YOLOv5ROS2(Node):
         color_sub = message_filters.Subscriber(self, Image, color_topic, qos_profile=qos_profile_sensor_data)
         depth_sub = message_filters.Subscriber(self, Image, depth_topic, qos_profile=qos_profile_sensor_data)
         self.ts = message_filters.ApproximateTimeSynchronizer(
-            [color_sub, depth_sub], queue_size=10, slop=0.5
+            [color_sub, depth_sub],
+            queue_size=10,
+            slop=self.max_rgb_depth_skew,
         )
         self.ts.registerCallback(self.synced_callback)
 
@@ -148,6 +239,17 @@ class YOLOv5ROS2(Node):
         else:
             self.get_logger().info('RGB video recording is DISABLED.')
         self.get_logger().info(f"Detection ROI is set to the central {self.roi_scale*100}% of the image.")
+        self.get_logger().info(
+            "Full-frame highest-confidence reacquisition is %s."
+            % ("ENABLED" if self.allow_full_frame_reacquisition else "DISABLED")
+        )
+        self.get_logger().info(
+            "RGB/depth registration enabled: max skew=%.3fs, t_depth_in_color=%s"
+            % (
+                self.max_rgb_depth_skew,
+                self.depth_to_color_translation.tolist(),
+            )
+        )
 
         # <<< ADDED: 为 2Hz 发布频率限制做准备 >>>
         self.publish_period = 1.0 / 2.0  # 2 Hz 的周期为 0.5 秒
@@ -165,7 +267,11 @@ class YOLOv5ROS2(Node):
         if self.detection_log_file is not None and not self.detection_log_file.closed:
             self.detection_log_file.close()
             self.get_logger().info("Detection evaluation log closed.")
-        cv2.destroyAllWindows()
+        if self.show_image:
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
         super().destroy_node()
 
     def write_detection_log(self, row):
@@ -189,6 +295,26 @@ class YOLOv5ROS2(Node):
         pass
 
     def synced_callback(self, color_msg, depth_msg):
+        color_stamp_s = (
+            float(color_msg.header.stamp.sec)
+            + float(color_msg.header.stamp.nanosec) / 1e9
+        )
+        depth_stamp_s = (
+            float(depth_msg.header.stamp.sec)
+            + float(depth_msg.header.stamp.nanosec) / 1e9
+        )
+        if not image_timestamps_within_skew(
+            color_stamp_s,
+            depth_stamp_s,
+            self.max_rgb_depth_skew,
+        ):
+            self.get_logger().warn(
+                "RGB与深度帧时间差超过 %.3fs，丢弃该图像对。"
+                % self.max_rgb_depth_skew,
+                throttle_duration_sec=2,
+            )
+            return
+
         # <<< MODIFIED: 检查是否达到了发布频率 >>>
         current_time = self.get_clock().now()
         elapsed_time = (current_time - self.last_publish_time).nanoseconds / 1e9
@@ -205,9 +331,32 @@ class YOLOv5ROS2(Node):
         try:
             color_image = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
             depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
-            self.process_images(color_image, depth_image)
+            self.process_images(
+                color_image,
+                depth_image,
+                depth_msg.encoding,
+                self._pose_matching_header(color_msg.header, current_time),
+            )
         except Exception as e:
             self.get_logger().error(f"Failed to process synced images: {e}")
+
+    def _pose_matching_header(self, source_header, frame_received_at):
+        """Use the source stamp only when it shares this node's clock domain."""
+        source_stamp_s = (
+            float(source_header.stamp.sec)
+            + float(source_header.stamp.nanosec) / 1e9
+        )
+        received_at_s = frame_received_at.nanoseconds / 1e9
+        header = Header(frame_id=TARGET_OBSERVATION_FRAME_ID)
+        if source_timestamp_matches_node_clock(source_stamp_s, received_at_s):
+            header.stamp = source_header.stamp
+        else:
+            header.stamp = frame_received_at.to_msg()
+            self.get_logger().warn(
+                "图像时间戳与节点时钟域不一致，改用该帧进入检测节点的时刻。",
+                throttle_duration_sec=5,
+            )
+        return header
 
     def get_unique_filename(self):
         # ... (此部分代码不变)
@@ -221,7 +370,13 @@ class YOLOv5ROS2(Node):
                 return full_path
             i += 1
         
-    def process_images(self, color_image, depth_image):
+    def process_images(
+        self,
+        color_image,
+        depth_image,
+        depth_encoding='',
+        observation_header=None,
+    ):
         # ... (此方法内的所有代码都不需要改变)
         self.frame_index += 1
         frame_time = self.get_clock().now().nanoseconds / 1e9
@@ -246,9 +401,30 @@ class YOLOv5ROS2(Node):
         if self.is_recording and self.video_writer is not None:
             self.video_writer.write(color_image)
             
+        try:
+            depth_scale = depth_scale_for_encoding(
+                depth_encoding,
+                getattr(depth_image.dtype, 'kind', None),
+            )
+        except ValueError as exc:
+            self.get_logger().error(str(exc), throttle_duration_sec=2)
+            return
+
+        depth_image_color_m = align_depth_to_color(
+            np.asarray(depth_image, dtype=float) * depth_scale,
+            self.depth_intrinsics,
+            self.color_intrinsics,
+            color_image.shape[:2],
+            depth_to_color_translation=self.depth_to_color_translation,
+        )
+
         height, width, _ = color_image.shape
         center_y_img, center_x_img = height // 2, width // 2
-        depth_center = depth_image[center_y_img, center_x_img] * 0.001
+        depth_center = self.get_robust_depth(
+            depth_image_color_m,
+            center_x_img,
+            center_y_img,
+        )
         
         center_height = Float32()
         center_height.data = float(depth_center)
@@ -274,64 +450,123 @@ class YOLOv5ROS2(Node):
                 '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', False
             ])
         
+        candidates = []
         for i, result in enumerate(results):
             x1, y1, x2, y2, conf, cls = result
             center_x_pixel = int((x1 + x2) / 2)
             center_y_pixel = int((y1 + y2) / 2)
             class_name = self.model.names[int(cls)] if hasattr(self.model, "names") else str(int(cls))
             in_roi = roi_x1 <= center_x_pixel <= roi_x2 and roi_y1 <= center_y_pixel <= roi_y2
+            depth = self.get_robust_depth(
+                depth_image_color_m,
+                center_x_pixel,
+                center_y_pixel,
+            )
+            candidates.append({
+                'target_index': i + 1,
+                'class_id': int(cls),
+                'class_name': class_name,
+                'confidence': float(conf),
+                'box': (x1, y1, x2, y2),
+                'center_x': center_x_pixel,
+                'center_y': center_y_pixel,
+                'center_distance_sq': (
+                    (center_x_pixel - center_x_img) ** 2
+                    + (center_y_pixel - center_y_img) ** 2
+                ),
+                'in_roi': in_roi,
+                'depth_m': depth,
+            })
 
-            if not in_roi:
-                self.get_logger().info(f"[Target {i+1}] is outside ROI, skipping.")
-                self.write_detection_log([
-                    f"{frame_time:.6f}", self.frame_index,
-                    self.current_mission_state, self.current_mission_phase,
-                    self.model_name, self.weights_path, self.conf_threshold, self.roi_scale, detections_in_frame,
-                    i + 1, int(cls), class_name, f"{conf:.6f}",
-                    f"{x1:.2f}", f"{y1:.2f}", f"{x2:.2f}", f"{y2:.2f}",
-                    center_x_pixel, center_y_pixel, False, '', '', '', '', False
-                ])
-                continue
+        selected = choose_highest_confidence_candidate(
+            candidates,
+            allow_outside_roi=self.allow_full_frame_reacquisition,
+        )
 
-            cv2.rectangle(display_image, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-            label = f"{class_name} {conf:.2f}"
+        if selected is None and candidates:
+            self.get_logger().warn(
+                "Detections were present, but none had valid depth in the allowed search area."
+            )
+
+        for candidate in candidates:
+            x1, y1, x2, y2 = candidate['box']
+            is_selected = candidate is selected
+            if is_selected:
+                color = (0, 255, 0)
+                thickness = 3
+                selection_text = "SELECTED"
+            elif candidate['depth_m'] <= 0.0:
+                color = (0, 0, 255)
+                thickness = 1
+                selection_text = "NO_DEPTH"
+            else:
+                color = (0, 165, 255)
+                thickness = 1
+                selection_text = "CANDIDATE"
+
+            cv2.rectangle(
+                display_image,
+                (int(x1), int(y1)),
+                (int(x2), int(y2)),
+                color,
+                thickness,
+            )
+            label = (
+                f"{candidate['class_name']} {candidate['confidence']:.2f} "
+                f"{selection_text}"
+            )
             cv2.putText(
                 display_image,
                 label,
                 (int(x1), max(int(y1) - 8, 20)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
-                (0, 255, 0),
+                color,
                 2
             )
-            self.get_logger().info(f"--- [Target {i+1}] (VALID) Debug Info ---")
-            self.get_logger().info(f"  Pixel Coords (u,v): ({center_x_pixel}, {center_y_pixel})")
-
-            depth = self.get_robust_depth(depth_image, center_x_pixel, center_y_pixel)
-            self.get_logger().info(f"  Calculated Depth (Z): {depth:.3f} meters")
-
             X = Y = Z = ''
             published = False
-            if depth > 0:
-                X, Y, Z = self.pixel_to_world(center_x_pixel, center_y_pixel, depth)
-                self.get_logger().info(f"  World Coords (X,Y,Z): ({X:.3f}, {Y:.3f}, {Z:.3f})")
-                self.process_and_publish(X, Y, Z)
+            if is_selected:
+                X, Y, Z = self.pixel_to_world(
+                    candidate['center_x'],
+                    candidate['center_y'],
+                    candidate['depth_m'],
+                )
+                self.process_and_publish(
+                    X,
+                    Y,
+                    Z,
+                    candidate['confidence'],
+                    observation_header,
+                )
                 published = True
-            else:
-                self.get_logger().warn(f"  [Target {i+1}] Invalid depth (0), skipping.")
+                location = "inside ROI" if candidate['in_roi'] else "outside ROI (reacquired)"
+                self.get_logger().info(
+                    "Selected highest-confidence target %d: conf=%.3f, %s, "
+                    "pixel=(%d,%d), depth=%.3fm"
+                    % (
+                        candidate['target_index'],
+                        candidate['confidence'],
+                        location,
+                        candidate['center_x'],
+                        candidate['center_y'],
+                        candidate['depth_m'],
+                    )
+                )
             self.write_detection_log([
                 f"{frame_time:.6f}", self.frame_index,
                 self.current_mission_state, self.current_mission_phase,
                 self.model_name, self.weights_path, self.conf_threshold, self.roi_scale, detections_in_frame,
-                i + 1, int(cls), class_name, f"{conf:.6f}",
+                candidate['target_index'], candidate['class_id'], candidate['class_name'],
+                f"{candidate['confidence']:.6f}",
                 f"{x1:.2f}", f"{y1:.2f}", f"{x2:.2f}", f"{y2:.2f}",
-                center_x_pixel, center_y_pixel, True, f"{depth:.6f}",
+                candidate['center_x'], candidate['center_y'], candidate['in_roi'],
+                f"{candidate['depth_m']:.6f}" if candidate['depth_m'] > 0.0 else '',
                 f"{X:.6f}" if published else '',
                 f"{Y:.6f}" if published else '',
                 f"{Z:.6f}" if published else '',
                 published
             ])
-            self.get_logger().info(f"--------------------------")
 
         if self.show_image:
             cv2.imshow("Detection with ROI", display_image)
@@ -350,7 +585,7 @@ class YOLOv5ROS2(Node):
                 detections.append([x1, y1, x2, y2, conf, cls])
         return np.array(detections)
 
-    def get_robust_depth(self, depth_image, x, y, size=5):
+    def get_robust_depth(self, depth_image, x, y, size=5, depth_scale=1.0):
         # ... (此部分代码不变)
         h, w = depth_image.shape
         x1 = max(0, x - size // 2); x2 = min(w - 1, x + size // 2)
@@ -358,7 +593,7 @@ class YOLOv5ROS2(Node):
         patch = depth_image[y1:y2+1, x1:x2+1]
         valid_depths = patch[np.isfinite(patch) & (patch > 0)]
         if valid_depths.size > 0:
-            return float(np.median(valid_depths))* 0.001
+            return float(np.median(valid_depths)) * depth_scale
         return 0.0
 
     def pixel_to_world(self, u, v, depth):
@@ -368,11 +603,26 @@ class YOLOv5ROS2(Node):
         Z = depth
         return X, Y, Z
 
-    def process_and_publish(self, X, Y, Z):
-        # ... (此部分代码不变)
-        point_msg = Point(x=float(X), y=float(Y), z=float(Z))
-        self.publisher.publish(point_msg)
-        self.get_logger().info(f'Published Target: X={point_msg.x:.3f}, Y={point_msg.y:.3f}, Z={point_msg.z:.3f}')
+    def process_and_publish(self, X, Y, Z, confidence, observation_header=None):
+        observation_msg = PointCloud()
+        if observation_header is None:
+            observation_msg.header.stamp = self.get_clock().now().to_msg()
+            observation_msg.header.frame_id = TARGET_OBSERVATION_FRAME_ID
+        else:
+            observation_msg.header = observation_header
+        observation_msg.points = [Point32(x=float(X), y=float(Y), z=float(Z))]
+        observation_msg.channels = [
+            ChannelFloat32(name='confidence', values=[float(confidence)])
+        ]
+        self.observation_publisher.publish(observation_msg)
+
+        if self.publish_legacy_target_position:
+            point_msg = Point(x=float(X), y=float(Y), z=float(Z))
+            self.publisher.publish(point_msg)
+        self.get_logger().info(
+            'Published Target: X=%.3f, Y=%.3f, Z=%.3f, confidence=%.3f'
+            % (X, Y, Z, confidence)
+        )
 
 def main(args=None):
     rclpy.init(args=args)
