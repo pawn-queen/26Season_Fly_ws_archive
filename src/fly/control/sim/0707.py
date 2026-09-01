@@ -3107,9 +3107,9 @@ def main(args=None) -> None:
                         help='Maximum time in seconds for the entire dropping phase.')
     parser.add_argument('--search-timeout', type=float, default=5.0,
                         help='Maximum time in seconds for each search attempt.')
-    parser.add_argument('--second-align-maxtime', type=float, default=15,
+    parser.add_argument('--second-align-maxtime', type=float, default=8.0,
                         help='Maximum time in seconds for each search attempt.')
-    parser.add_argument('--first-align-maxtime', type=float, default=5, 
+    parser.add_argument('--first-align-maxtime', type=float, default=12.0,
                         help='Maximum time in seconds for the first alignment phase before forcing a drop.')
     
     
@@ -3206,7 +3206,7 @@ def main(args=None) -> None:
                         help='判断无人机到达导航点（如投水区）的误差阈值（米）。')
     parser.add_argument('--target-approach-threshold', type=float, default=0.3,
                         help='判断无人机飞到目标上方，可以开始精确对准的误差阈值（米）。')
-    parser.add_argument('--alignment-altitude-threshold', type=float, default=0.5,
+    parser.add_argument('--alignment-altitude-threshold', type=float, default=0.2,
                         help='在检查X/Y对准前，无人机必须达到的高度误差阈值（米）。')
     parser.add_argument('--headless', action='store_true',
                         help='以无头模式运行，不显示摄像头的GUI窗口。')

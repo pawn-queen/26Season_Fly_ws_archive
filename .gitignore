@@ -3,9 +3,6 @@ install/
 log/
 ~/
 flylogs/
-src/fly/control/gui_support.py
-src/fly/test/test_gui_support.py
-
 __pycache__/
 *.pyc
 .pytest_cache/
