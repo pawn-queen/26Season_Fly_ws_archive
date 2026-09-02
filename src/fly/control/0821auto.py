@@ -27,8 +27,12 @@ import os
 import csv
 import argparse # <<< 新增
 import sys      # <<< 新增
+import threading
+import traceback
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor, ShutdownException
 
 class DroppingState(Enum):
     IDLE = 0
@@ -82,6 +86,20 @@ class OffboardControl(Node):
             depth=1,
         )
 
+        # 将任务状态机、视觉推理、USB 相机和 Offboard 心跳隔离。
+        # 每组内部仍然互斥，避免同一类有状态回调重入。
+        self.mission_callback_group = MutuallyExclusiveCallbackGroup()
+        self.vision_callback_group = MutuallyExclusiveCallbackGroup()
+        self.heartbeat_callback_group = MutuallyExclusiveCallbackGroup()
+        self.image_callback_group = MutuallyExclusiveCallbackGroup()
+
+        # 多线程执行器下，共享数据必须以完整快照为单位交换。
+        self._pose_lock = threading.Lock()
+        self._frame_lock = threading.Lock()
+        self._vision_result_lock = threading.Lock()
+        self._map_data_lock = threading.Lock()
+        self._vision_ready_event = threading.Event()
+
         # Create publishers
         self.offboard_control_mode_publisher = self.create_publisher(
             OffboardControlMode, '/fmu/in/offboard_control_mode', qos_profile)
@@ -92,21 +110,26 @@ class OffboardControl(Node):
 
         # Create subscribers
         self.vehicle_local_position_subscriber = self.create_subscription(
-            VehicleLocalPosition, '/fmu/out/vehicle_local_position_v1', self.vehicle_local_position_callback, qos_profile)
+            VehicleLocalPosition, '/fmu/out/vehicle_local_position_v1', self.vehicle_local_position_callback,
+            qos_profile, callback_group=self.mission_callback_group)
         self.vehicle_status_subscriber = self.create_subscription(
-            VehicleStatus, '/fmu/out/vehicle_status_v1', self.vehicle_status_callback, qos_profile)
+            VehicleStatus, '/fmu/out/vehicle_status_v1', self.vehicle_status_callback,
+            qos_profile, callback_group=self.mission_callback_group)
         self.target_position_subscriber = self.create_subscription(Point, '/target_position',
                                                                    self.target_position_callback,
-                                                                   target_qos_profile)
+                                                                   target_qos_profile,
+                                                                   callback_group=self.mission_callback_group)
         self.target_observation_subscriber = self.create_subscription(
             PointCloud,
             '/target_observation',
             self.target_observation_callback,
             target_qos_profile,
+            callback_group=self.mission_callback_group,
         )
 
         self.vehicle_odometry_subscriber = self.create_subscription(
-            VehicleOdometry, '/fmu/out/vehicle_odometry', self.vehicle_odometry_callback, qos_profile)
+            VehicleOdometry, '/fmu/out/vehicle_odometry', self.vehicle_odometry_callback,
+            qos_profile, callback_group=self.mission_callback_group)
 
         #这是广角相机的内参和畸变参数
         self.camera_matrix = np.array([
@@ -220,6 +243,10 @@ class OffboardControl(Node):
         self.latest_frame = None  # 用于存储最新接收到的图像帧
         # A map sample must use the vehicle pose captured with its image frame.
         self.latest_frame_pose_snapshot = None
+        self.latest_frame_received_time_ns = None
+        self.latest_frame_monotonic_ns = None
+        self.latest_frame_sequence = 0
+        self.last_processed_frame_sequence = -1
 
         self.is_vision_ready = False
 
@@ -380,6 +407,7 @@ class OffboardControl(Node):
         self.world_target_coordinates_ned = {}
         self.widecam_map_reset_state = None
         self.widecam_local_reference_warned = False
+        self.global_map_accepting_samples = False
 
         #==================投水状态机=================
         self.servo_step_delay = args.servo_step_delay  # 每个舵机动作之间的延迟（秒），可以根据实际情况调整
@@ -409,15 +437,36 @@ class OffboardControl(Node):
 
         # Create a timer to publish control commands
         self.dt = args.timer_period             # 控制周期 (秒) - 与timer频率一致
-        self.control_timer = self.create_timer(self.dt, self.control_timer_callback)
+        self.control_timer = self.create_timer(
+            self.dt,
+            self.control_timer_callback,
+            callback_group=self.mission_callback_group,
+        )
+        self.offboard_heartbeat_timer = self.create_timer(
+            self.dt,
+            self.offboard_heartbeat_timer_callback,
+            callback_group=self.heartbeat_callback_group,
+        )
+        self.camera_timer = self.create_timer(
+            self.dt,
+            self.camera_timer_callback,
+            callback_group=self.image_callback_group,
+        )
 
         # 创建一个新的、较慢的视觉处理定时器
         self.vision_processing_period = args.vision_timer_period # 10Hz, 可根据设备性能调整
-        self.vision_timer = self.create_timer(self.vision_processing_period, self.vision_timer_callback)
+        self.vision_timer = self.create_timer(
+            self.vision_processing_period,
+            self.vision_timer_callback,
+            callback_group=self.vision_callback_group,
+        )
 
         # 创建一个线程安全的变量来存储视觉结果
         self.latest_vision_info = []
         self.latest_annotated_frame = None
+        self.latest_vision_frame_pose = None
+        self.latest_vision_frame_sequence = -1
+        self.latest_vision_mission_state = None
         # 起飞高度判断阈值
         self.takeoff_threshold = args.takeoff_threshold
         # 向前飞行到达点阈值
@@ -721,7 +770,8 @@ class OffboardControl(Node):
 
     def vehicle_local_position_callback(self, vehicle_local_position):
         """Callback function for vehicle_local_position topic subscriber."""
-        self.vehicle_local_position = vehicle_local_position
+        with self._pose_lock:
+            self.vehicle_local_position = vehicle_local_position
         current_reset_state = self._local_position_reset_state()
         if (
             self.is_final_aligning
@@ -739,14 +789,20 @@ class OffboardControl(Node):
 
     def _capture_widecam_pose_snapshot(self):
         """Return a valid NED/attitude state to associate with a camera frame."""
-        position = self.vehicle_local_position
+        # 相机回调与 PX4 位姿回调并行执行；一次性复制组合位姿，避免
+        # position、roll/pitch 和姿态时间戳来自不同次更新。
+        with self._pose_lock:
+            position = self.vehicle_local_position
+            vehicle_roll = self.vehicle_roll
+            vehicle_pitch = self.vehicle_pitch
+            attitude_timestamp_us = self.vehicle_attitude_timestamp_us
         values = (
             position.x,
             position.y,
             position.z,
             position.heading,
-            self.vehicle_roll,
-            self.vehicle_pitch,
+            vehicle_roll,
+            vehicle_pitch,
         )
         if not all(math.isfinite(value) for value in values):
             return None
@@ -763,10 +819,10 @@ class OffboardControl(Node):
 
         timestamp_us = (getattr(position, 'timestamp_sample', 0) or
                         getattr(position, 'timestamp', 0))
-        if self.vehicle_attitude_timestamp_us is None:
+        if attitude_timestamp_us is None:
             return None
         if (timestamp_us and
-                abs(timestamp_us - self.vehicle_attitude_timestamp_us) >
+                abs(timestamp_us - attitude_timestamp_us) >
                 self.widecam_pose_attitude_skew_us):
             return None
 
@@ -781,8 +837,8 @@ class OffboardControl(Node):
             'y': float(position.y),
             'z': float(position.z),
             'yaw': float(position.heading),
-            'roll': float(self.vehicle_roll),
-            'pitch': float(self.vehicle_pitch),
+            'roll': float(vehicle_roll),
+            'pitch': float(vehicle_pitch),
             'horizontal_speed': horizontal_speed,
             'timestamp_us': timestamp_us,
             'reset_state': (
@@ -811,12 +867,15 @@ class OffboardControl(Node):
         q /= np.linalg.norm(q)
 
         # 从四元数转换为欧拉角 (roll, pitch, yaw)，单位是弧度
-        (self.vehicle_roll,
-         self.vehicle_pitch,
-         _) = R.from_quat(q).as_euler('xyz', degrees=False)
-        self.vehicle_attitude_timestamp_us = (
-            getattr(msg, 'timestamp_sample', 0) or getattr(msg, 'timestamp', 0)
+        vehicle_roll, vehicle_pitch, _ = R.from_quat(q).as_euler(
+            'xyz', degrees=False
         )
+        with self._pose_lock:
+            self.vehicle_roll = vehicle_roll
+            self.vehicle_pitch = vehicle_pitch
+            self.vehicle_attitude_timestamp_us = (
+                getattr(msg, 'timestamp_sample', 0) or getattr(msg, 'timestamp', 0)
+            )
         # Yaw我们继续使用更稳定的 vehicle_local_position.heading
 
 
@@ -862,6 +921,10 @@ class OffboardControl(Node):
         msg.body_rate = False
         msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
         self.offboard_control_mode_publisher.publish(msg)
+
+    def offboard_heartbeat_timer_callback(self):
+        """Publish the existing unconditional heartbeat on an isolated timer."""
+        self.publish_offboard_control_heartbeat_signal()
 
     def publish_position_setpoint(self, x: float, y: float, z: float):
         """Publish the trajectory setpoint."""
@@ -914,8 +977,8 @@ class OffboardControl(Node):
             except cv2.error:
                 pass
         # 调用父类的方法完成ROS节点的销毁
-        super().destroy_node()
         self.get_logger().info("清理完成，节点已关闭。")
+        return super().destroy_node()
 
     def find_video_device_by_name(self,name_hint="USB Camera"):
     # (This function remains unchanged)
@@ -930,6 +993,36 @@ class OffboardControl(Node):
                 match = re.search(r"(/dev/video\d+)", line)
                 if match: return match.group(1)
         return None
+
+    def camera_timer_callback(self):
+        """Capture one USB frame without blocking mission or heartbeat callbacks."""
+        try:
+            ret, frame = self.cap.read()
+        except cv2.error as exc:
+            self.get_logger().warn(
+                f"无法捕获图像: {exc}", throttle_duration_sec=2
+            )
+            return
+        if not ret:
+            self.get_logger().warn("无法捕获图像", throttle_duration_sec=2)
+            return
+
+        # OpenCV USB 帧没有曝光时间戳，这里记录的是 read() 返回后的主机接收时刻。
+        frame_received_ros_time_ns = self.get_clock().now().nanoseconds
+        frame_received_monotonic_ns = time.monotonic_ns()
+        frame_pose = self._capture_widecam_pose_snapshot()
+        if frame_pose is not None:
+            frame_pose = dict(frame_pose)
+            frame_pose['frame_received_ros_time_ns'] = frame_received_ros_time_ns
+            frame_pose['frame_received_monotonic_ns'] = frame_received_monotonic_ns
+
+        # 图像、采集时间、拍摄位姿和序号必须原子更新。
+        with self._frame_lock:
+            self.latest_frame = frame
+            self.latest_frame_pose_snapshot = frame_pose
+            self.latest_frame_received_time_ns = frame_received_ros_time_ns
+            self.latest_frame_monotonic_ns = frame_received_monotonic_ns
+            self.latest_frame_sequence += 1
 
 
     def drop_payload(self, drop_number: int):
@@ -2021,7 +2114,7 @@ class OffboardControl(Node):
         self.get_logger().info("最终任务地图构建完成。")
 
 
-    def _build_recon_mission_map(self, named_targets_frd):
+    def _build_recon_mission_map(self, named_targets_frd, sample_pose=None):
         """
         为侦察阶段构建任务地图。
         """
@@ -2033,17 +2126,26 @@ class OffboardControl(Node):
         self.get_logger().info("开始构建侦察任务地图...")
         # 侦察任务不需要用户指定顺序，直接按视觉模块返回的顺序（通常是按x轴排序）
         for target_data in named_targets_frd:
-            # 这里我们假设无人机在切换回Offboard后位置变化不大
-            # 一个更鲁棒的方法是记录切换回Offboard时的精确位置
-            current_x, current_y = self.coordinate_NED2FRD(self.vehicle_local_position.x, self.vehicle_local_position.y)
-
             x_frd, y_frd = target_data['coords_frd']
-
-            # 目标的绝对FRD坐标 = 当前无人机FRD坐标 + 目标相对无人机的FRD坐标
-            abs_x_frd = current_x + x_frd
-            abs_y_frd = current_y + y_frd
-
-            ned_x, ned_y = self.coordinate_FRD2NED(abs_x_frd, abs_y_frd)
+            if sample_pose is not None:
+                # 必须使用产生该视觉结果的图像位姿，不能使用推理结束后的当前位置。
+                ned_x, ned_y = self.coordinate_current_FRD2NED(
+                    x_frd,
+                    y_frd,
+                    origin_x=sample_pose['x'],
+                    origin_y=sample_pose['y'],
+                    yaw=sample_pose['yaw'],
+                )
+            else:
+                # 兼容没有帧位姿的旧调用路径。
+                current_x, current_y = self.coordinate_NED2FRD(
+                    self.vehicle_local_position.x,
+                    self.vehicle_local_position.y,
+                )
+                ned_x, ned_y = self.coordinate_FRD2NED(
+                    current_x + x_frd,
+                    current_y + y_frd,
+                )
 
             self.recon_targets_ned.append({
                 'name': target_data['name'],
@@ -2058,27 +2160,18 @@ class OffboardControl(Node):
     def control_timer_callback(self) -> None:
         """Callback function for the timer."""
         timer_start = self.get_clock().now()
-        self.publish_offboard_control_heartbeat_signal()
 
-        if not self.is_vision_ready:
-            # 只有在第一次进入timer_callback时执行
-            if self.vision_controller.load_model():
-                self.is_vision_ready = True
-                self.get_logger().info("视觉系统准备就绪，开始执行任务逻辑。")
-            else:
-                self.get_logger().error("视觉系统初始化失败，节点将不执行任务。")
-                return # 如果模型加载失败，直接返回，不执行后续逻辑
+        # 模型加载和 USB 采集分别由视觉组、相机组负责。任务状态机只消费
+        # 完整快照，不能再同步等待这些耗时操作。
+        if not self._vision_ready_event.is_set():
+            return
+        with self._frame_lock:
+            has_frame = self.latest_frame is not None
+        if not has_frame:
+            return
 
         # 更新日志计数器
         self.log_counter += 1
-
-        # --- 视觉处理部分 ---
-        ret, frame = self.cap.read()
-        if not ret:
-            self.get_logger().warn("无法捕获图像")
-            return
-        self.latest_frame = frame
-        self.latest_frame_pose_snapshot = self._capture_widecam_pose_snapshot()
 
         #进入offboard前发布位置控制点
         
@@ -2171,11 +2264,13 @@ class OffboardControl(Node):
 
             if self.is_AtDropArea and not self.is_FinishDrop:
                 if self.mission_state == MissionState.START:
-                    self.mission_state = MissionState.GLOBAL_SEARCH
-                    self.map_data_collection.clear()
-                    self.world_target_coordinates_ned.clear()
-                    self.mission_targets_ned.clear()
-                    self.widecam_map_reset_state = None
+                    with self._map_data_lock:
+                        self.mission_state = MissionState.GLOBAL_SEARCH
+                        self.map_data_collection.clear()
+                        self.world_target_coordinates_ned.clear()
+                        self.mission_targets_ned.clear()
+                        self.widecam_map_reset_state = None
+                        self.global_map_accepting_samples = True
                     self.get_logger().info(f"切换为GLOBAL_SEARCH模式。")
                     return
 
@@ -2195,7 +2290,11 @@ class OffboardControl(Node):
                 if self.mission_state == MissionState.GLOBAL_SEARCH:
 
                     # 开启usb摄像头识别
-                    self.current_vision_info = self.latest_vision_info
+                    (
+                        self.current_vision_info,
+                        _,
+                        _,
+                    ) = self._copy_latest_vision_result(MissionState.GLOBAL_SEARCH)
 
 
                     #启动全局搜索计时器
@@ -2211,7 +2310,9 @@ class OffboardControl(Node):
                     ## 全局搜索到达时间后
                     if elapsed_search_time > self.search_timeout:
                         self.get_logger().info("搜索时间到，开始根据多帧平均结果和用户优先级构建最终任务地图。")
-                        self._calculate_and_store_average_map()
+                        with self._map_data_lock:
+                            self.global_map_accepting_samples = False
+                            self._calculate_and_store_average_map()
 
                         if not self.mission_targets_ned:
                             self.get_logger().error("搜索结束但未规划任何有效目标！进入超时投放。")
@@ -2413,10 +2514,17 @@ class OffboardControl(Node):
                         self.recon_search_start_time = self.get_clock().now()
                     self.publish_position_setpoint(self.vehicle_local_position.x, self.vehicle_local_position.y, self.initial_z + self.recon_search_height)
                     elapsed_search_time = (self.get_clock().now() - self.recon_search_start_time).nanoseconds / 1e9
-                    self.current_vision_info = self.latest_vision_info
+                    (
+                        self.current_vision_info,
+                        recon_frame_pose,
+                        _,
+                    ) = self._copy_latest_vision_result(MissionState.RECON_SEARCH)
                     if elapsed_search_time > self.recon_search_timeout:
                         self.get_logger().info("侦察搜索时间到，构建侦察地图...")
-                        self._build_recon_mission_map(self.current_vision_info)
+                        self._build_recon_mission_map(
+                            self.current_vision_info,
+                            sample_pose=recon_frame_pose,
+                        )
                         if not self.recon_targets_ned:
                             self.get_logger().error("未发现任何侦察目标！任务结束。")
                             self.mission_state = MissionState.MISSION_COMPLETE
@@ -2550,72 +2658,185 @@ class OffboardControl(Node):
 
         self.offboard_setpoint_counter += 1
 
-        # =================== 显示图像 ===================
-    # 显示由视觉定时器生成的最新标注图像
-        if self.show_video:
-            if self.latest_annotated_frame is not None:
-                try:
-                    cv2.imshow("Drone View", self.latest_annotated_frame)
-                    cv2.waitKey(1)
-                except cv2.error as exc:
-                    self.show_video = False
-                    self.get_logger().warn(
-                        f"OpenCV窗口不可用，后续自动无头运行: {exc}"
-                    )
         elasped_timer_time = (self.get_clock().now() - timer_start).nanoseconds / 1e9
         if self.offboard_setpoint_counter % 150 == 0:
             self.get_logger().info(f"控制循环花费时间：{elasped_timer_time:.5f}s")
 
+    def _copy_latest_vision_result(self, expected_state):
+        """Return one internally consistent vision result for the requested state."""
+        with self._vision_result_lock:
+            if self.latest_vision_mission_state != expected_state:
+                return [], None, -1
+            vision_info = [dict(target) for target in self.latest_vision_info]
+            frame_pose = (
+                dict(self.latest_vision_frame_pose)
+                if self.latest_vision_frame_pose is not None else None
+            )
+            frame_sequence = self.latest_vision_frame_sequence
+        return vision_info, frame_pose, frame_sequence
+
+    def display_latest_annotated_frame(self):
+        """Pump OpenCV GUI events from the process main thread only."""
+        if not self.show_video:
+            return
+        with self._vision_result_lock:
+            annotated_frame = self.latest_annotated_frame
+        if annotated_frame is None:
+            return
+        try:
+            cv2.imshow("Drone View", annotated_frame)
+            cv2.waitKey(1)
+        except cv2.error as exc:
+            self.show_video = False
+            self.get_logger().warn(
+                f"OpenCV窗口不可用，后续自动无头运行: {exc}"
+            )
+
     def vision_timer_callback(self):
-        """
-        这个回调以较低频率运行，专门处理耗时的视觉任务。
-        """
+        """Load the model and process only the newest unprocessed USB frame."""
         timer_start = self.get_clock().now()
-        if not self.is_vision_ready or self.latest_frame is None:
+        if not self._vision_ready_event.is_set():
+            if self.vision_controller.load_model():
+                self.is_vision_ready = True
+                self._vision_ready_event.set()
+                self.get_logger().info("视觉系统准备就绪，开始执行任务逻辑。")
+            else:
+                self.get_logger().error(
+                    "视觉系统初始化失败，节点将不执行任务。",
+                    throttle_duration_sec=2,
+                )
             return
 
-        # 复制帧以进行处理
-        frame_to_process = self.latest_frame.copy()
-        frame_pose = self.latest_frame_pose_snapshot
+        # 帧、位姿、时间戳和序号必须在同一把锁内读取。
+        with self._frame_lock:
+            frame_sequence = self.latest_frame_sequence
+            if (
+                self.latest_frame is None
+                or frame_sequence == self.last_processed_frame_sequence
+            ):
+                return
+            frame_to_process = self.latest_frame.copy()
+            frame_pose = (
+                dict(self.latest_frame_pose_snapshot)
+                if self.latest_frame_pose_snapshot is not None else None
+            )
+            self.last_processed_frame_sequence = frame_sequence
+
         if frame_pose is None:
             return
 
-        # <<< 核心决策逻辑 >>>
-        num_targets_for_vision = 0 # 默认不处理
-
-        # 状态1：投水前的全局搜索，需要找 3 个目标
-        if self.mission_state == MissionState.GLOBAL_SEARCH:
+        # 推理可能比状态机慢，因此记录开始推理时的状态；状态已变化时丢弃结果。
+        mission_state_at_start = self.mission_state
+        num_targets_for_vision = 0
+        if mission_state_at_start == MissionState.GLOBAL_SEARCH:
             num_targets_for_vision = 3
-
-        # 状态2：侦察阶段的搜索，需要找 5 个目标
-        elif self.mission_state == MissionState.RECON_SEARCH:
+        elif mission_state_at_start == MissionState.RECON_SEARCH:
             num_targets_for_vision = 5
 
-        # 核心视觉处理调用
         initial_z = self.initial_z if self.initial_z is not None else 0.0
         current_altitude = frame_pose['z'] - initial_z
         vision_info, annotated_frame = self.vision_controller.process_frame(
             frame_to_process,
             current_altitude,
-            max_targets_to_confirm=num_targets_for_vision, # <<< 将决策结果传入
+            max_targets_to_confirm=num_targets_for_vision,
             roll=frame_pose['roll'],
-            pitch=frame_pose['pitch']
+            pitch=frame_pose['pitch'],
         )
 
-        # 只有在进行有效处理时才更新视觉信息
+        if self.mission_state != mission_state_at_start:
+            return
+
+        cv2.putText(
+            annotated_frame,
+            f"State: {mission_state_at_start.name}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+        )
+        cv2.putText(
+            annotated_frame,
+            f"Vision Targets: {num_targets_for_vision}",
+            (10, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 0),
+            2,
+        )
+
         if num_targets_for_vision > 0:
-            self.latest_vision_info = vision_info
-            if self.mission_state == MissionState.GLOBAL_SEARCH:
-                self._collect_global_search_map_sample(vision_info, frame_pose)
+            vision_info_snapshot = [dict(target) for target in vision_info]
+            with self._vision_result_lock:
+                self.latest_vision_info = vision_info_snapshot
+                self.latest_vision_frame_pose = dict(frame_pose)
+                self.latest_vision_frame_sequence = frame_sequence
+                self.latest_vision_mission_state = mission_state_at_start
+                self.latest_annotated_frame = annotated_frame
 
-        # 更新用于显示的 annotated_frame (无论是否处理都更新，以便显示状态)
-        cv2.putText(annotated_frame, f"State: {self.mission_state.name}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(annotated_frame, f"Vision Targets: {num_targets_for_vision}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2) # 添加一个状态显示
-        self.latest_annotated_frame = annotated_frame
+            if mission_state_at_start == MissionState.GLOBAL_SEARCH:
+                with self._map_data_lock:
+                    if (
+                        self.global_map_accepting_samples
+                        and self.mission_state == MissionState.GLOBAL_SEARCH
+                    ):
+                        self._collect_global_search_map_sample(
+                            vision_info_snapshot,
+                            frame_pose,
+                        )
+        else:
+            with self._vision_result_lock:
+                self.latest_annotated_frame = annotated_frame
 
-        elasped_timer_time = (self.get_clock().now() - timer_start).nanoseconds / 1e9
+        elasped_timer_time = (
+            self.get_clock().now() - timer_start
+        ).nanoseconds / 1e9
         if self.offboard_setpoint_counter % 150 == 0:
-            self.get_logger().info(f"视觉循环花费时间：{elasped_timer_time:.5f}")
+            self.get_logger().info(
+                f"视觉循环花费时间：{elasped_timer_time:.5f}"
+            )
+
+
+def spin_control_node_safely(node: OffboardControl) -> None:
+    """Run ROS callbacks on four workers while keeping OpenCV GUI on main."""
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+    # ServoControl 是另一个 ROS Node；只有加入 executor 后它的订阅回调才会执行。
+    executor.add_node(node.servo_control)
+    executor_stop = threading.Event()
+
+    def spin_executor():
+        while rclpy.ok() and not executor_stop.is_set():
+            try:
+                executor.spin_once(timeout_sec=0.1)
+            except (ExternalShutdownException, ShutdownException):
+                break
+            except Exception as exc:
+                node.get_logger().error(
+                    "ROS回调发生异常，已记录并继续调度其他回调："
+                    f"{exc}\n{traceback.format_exc()}",
+                    throttle_duration_sec=2,
+                )
+
+    executor_thread = threading.Thread(
+        target=spin_executor,
+        name='offboard-ros-executor',
+        daemon=True,
+    )
+    executor_thread.start()
+
+    try:
+        while rclpy.ok() and executor_thread.is_alive():
+            node.display_latest_annotated_frame()
+            time.sleep(0.01)
+    finally:
+        executor_stop.set()
+        executor.wake()
+        executor_thread.join(timeout=2.0)
+        executor.shutdown()
+        executor_thread.join(timeout=2.0)
+        executor.remove_node(node.servo_control)
+        executor.remove_node(node)
 
 
 def main(args=None) -> None:
@@ -2925,13 +3146,17 @@ def main(args=None) -> None:
     offboard_control = OffboardControl(args=custom_args)
 
     try:
-        rclpy.spin(offboard_control)
+        spin_control_node_safely(offboard_control)
     except KeyboardInterrupt:
         print("程序被用户中断 (Ctrl+C)")
     finally:
         # 确保节点在退出时被正确销毁，从而触发我们的清理逻辑
-        offboard_control.destroy_node()
-        rclpy.shutdown()
+        try:
+            offboard_control.destroy_node()
+        finally:
+            offboard_control.servo_control.destroy_node()
+            if rclpy.ok():
+                rclpy.shutdown()
 
 if __name__ == '__main__':
     try:

@@ -3064,12 +3064,12 @@ def main(args=None) -> None:
     
     parser.add_argument('--takeoff-height', type=float, default=-2.8,
                         help='Takeoff height in meters (negative value for altitude).')
-    parser.add_argument('--descent-height', type=float, default=0.8,
+    parser.add_argument('--descent-height', type=float, default=1.0,
                         help='Descent height after first alignment in meters (positive value).')
     
     parser.add_argument('--forward-x', type=float, default=3,
                         help='Forward distance to fly to the drop area in meters.')
-    parser.add_argument('--search-height', type=float, default=-4.5,
+    parser.add_argument('--search-height', type=float, default=-5.5,
                         help='Global search height in meters (negative value for altitude).')
    
     parser.add_argument('--align-maxstep', type=float, default=0.2,
@@ -3107,9 +3107,9 @@ def main(args=None) -> None:
                         help='Maximum time in seconds for the entire dropping phase.')
     parser.add_argument('--search-timeout', type=float, default=5.0,
                         help='Maximum time in seconds for each search attempt.')
-    parser.add_argument('--second-align-maxtime', type=float, default=8.0,
+    parser.add_argument('--second-align-maxtime', type=float, default=10.0,
                         help='Maximum time in seconds for each search attempt.')
-    parser.add_argument('--first-align-maxtime', type=float, default=12.0,
+    parser.add_argument('--first-align-maxtime', type=float, default=15.0,
                         help='Maximum time in seconds for the first alignment phase before forcing a drop.')
     
     
@@ -3152,7 +3152,7 @@ def main(args=None) -> None:
 
     parser.add_argument('--simulated-drop-evaluation', action=argparse.BooleanOptionalAction, default=True,
                         help='Evaluate each release as a virtual ballistic payload in the simulator.')
-    parser.add_argument('--sim-drop-hit-radius', type=float, default=0.5,
+    parser.add_argument('--sim-drop-hit-radius', type=float, default=0.15,
                         help='Maximum predicted impact error for a successful precise drop (m).')
     parser.add_argument('--sim-drop-gravity', type=float, default=9.80665,
                         help='Down-positive gravity for virtual payload propagation (m/s²).')
