@@ -416,7 +416,7 @@ class OffboardControl(Node):
 
         # ========== 目标像素坐标日志 ==========
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        log_dir = '/home/kpc/flylogs'
+        log_dir = '/home/pixel/flylogs'
         log_filename = f'bucket_pixel_log_{timestamp}.csv'
         os.makedirs(log_dir, exist_ok=True)
         self.pixel_log_path = os.path.join(log_dir, log_filename)
@@ -1035,12 +1035,12 @@ class OffboardControl(Node):
             if drop_number == 1 :
             # 第一次投水：MAIN6（param2）打开，MAIN5保持归中
                 self.get_logger().info(f"第 {drop_number} 次投水 - 步骤 1: MAIN5=0.0, MAIN6=1.0")
-                self.servo_control.publish_dual_actuator_command(0.0, 1.0)   # ← 改用同步控制  
+                self.servo_control.publish_dual_actuator_command(-1.0, -1.0)   # ← 改用同步控制  
                   
             elif drop_number == 2 :
             # 第二次投水：MAIN5（param1）打开，MAIN6反向打开
                 self.get_logger().info(f"第 {drop_number} 次投水 - 步骤 1: MAIN5=1.0, MAIN6=-1.0")
-                self.servo_control.publish_dual_actuator_command(1.0, -1.0)  # ← 改用同步控制，同时达到(1.0, -1.0)
+                self.servo_control.publish_dual_actuator_command(1.0, 0.0)  # ← 改用同步控制，同时达到(1.0, 0.0)
             self.current_dropping_state[drop_number] = DroppingState.STEP_1_COMMANDED
             self.last_servo_command_time[drop_number] = self.get_clock().now()
 
@@ -1065,9 +1065,9 @@ class OffboardControl(Node):
         # 这里使用您在ServoTester中验证过的舵机指令
         if state == DroppingState.STEP_1_COMMANDED:
             if drop_number == 1:
-                self.servo_control.publish_dual_actuator_command(0.0, 1.0)  # ← 改用同步控制
+                self.servo_control.publish_dual_actuator_command(-1.0, -1.0)  # ← 改用同步控制
             else: # drop_number == 2
-                self.servo_control.publish_dual_actuator_command(1.0, -1.0)  # ← 改用同步控制，同时达到(1.0, -1.0)
+                self.servo_control.publish_dual_actuator_command(1.0, 0.0)  # ← 改用同步控制，同时达到(1.0, -1.0)
             self.current_dropping_state[drop_number] = DroppingState.STEP_2_COMMANDED
             self.last_servo_command_time[drop_number] = self.get_clock().now()
 
@@ -1080,7 +1080,7 @@ class OffboardControl(Node):
             if drop_number == 1:
                 self.servo_control.publish_dual_actuator_command(-1.0, 0.0)  # ← 改用同步控制
             else: # drop_number == 2
-                self.servo_control.publish_dual_actuator_command(1.0, -1.0)  # ← 改用同步控制，同时达到(1.0, -1.0)
+                self.servo_control.publish_dual_actuator_command(1.0, 1.0)  # ← 改用同步控制，同时达到(1.0, -1.0)
             self.current_dropping_state[drop_number] = DroppingState.STEP_4_COMMANDED
             self.last_servo_command_time[drop_number] = self.get_clock().now()
 
