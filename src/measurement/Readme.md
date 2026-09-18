@@ -1,3 +1,0 @@
-# measurement文件夹（用作非飞行状态下的测量，校准与记录）
-
-本文件夹中是26赛季判断深度相机是否需要校准，相机拍摄图片与视频的文件夹；实际的realsense的校准方式使用SDK请见https://jishuzhan.net/article/2056174924087791618 的技术博客之一与realsense的官网https://dev.realsenseai.com/docs/calibration/，广角相机校准请自行准备菲林片标定板（又称棋盘图）进行校准（校准的图片在attachment的文件中,感谢open-cv的开源），校准方法请见https://docs.opencv.org/4.9.0/da/d0d/tutorial_camera_calibration_pattern.html（这里采用的是普通 pinhole + Brown 畸变模型也可（适用于中等广角），若采用强广角、鱼眼、大视场镜头则使用的Fisheye模型https://docs.opencv.org/4.13.0/d2/d14/namespacecv_1_1fisheye.html），本文中的wide-angle camera distortion-correction.py属于用正常的中等广角模型使用calibrateCamera标定

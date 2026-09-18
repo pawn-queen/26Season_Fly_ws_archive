@@ -15,3 +15,21 @@ __pycache__/
 .env
 venv/
 .venv/
+# ==============================
+# jetson-deploy local-only files
+# ==============================
+
+scripts/
+src/attachment/
+src/measurement/
+src/px4_msgs/
+src/px4_ros_com/
+src/fly/control/sim/
+src/fly/control/test/
+src/detect/detect/detect_ros_sim_lowHZ.py
+src/detect/test/
+bridge_config.yaml
+bridge.sh
+README.md
+src/fly/control/models/*.pt
+src/detect/models/*.pt
