@@ -31,5 +31,5 @@ src/detect/test/
 bridge_config.yaml
 bridge.sh
 README.md
-src/fly/control/models/*.pt
+src/fly/control/*.pt
 src/detect/models/*.pt
