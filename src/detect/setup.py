@@ -24,7 +24,7 @@ setup(
     entry_points={
         'console_scripts': [
             'detect = detect.detect_ros:main',
-            'test = detect.detect_ros_sim_lowHZ:main',  
+            'test = detect.detect_ros:main',  
         ],
     },
 )
