@@ -144,12 +144,16 @@ class YOLOv5ROS2(Node):
 
     def destroy_node(self):
         """在节点销毁时调用的清理函数，确保资源被释放"""
-        self.get_logger().info("Node is shutting down, attempting to clean up...")
+        context_is_valid = rclpy.ok(context=self.context)
+        if context_is_valid:
+            self.get_logger().info("Node is shutting down, attempting to clean up...")
         if self.video_writer is not None:
-            self.get_logger().info("Releasing video writer...")
+            if context_is_valid:
+                self.get_logger().info("Releasing video writer...")
             self.video_writer.release()
-            self.get_logger().info("Video writer released.")
-        else:
+            if context_is_valid:
+                self.get_logger().info("Video writer released.")
+        elif context_is_valid:
             self.get_logger().warn("Video writer was not initialized, no video to save.")
         if self.show_image:
             try:
@@ -426,7 +430,7 @@ def main(args=None):
         node.get_logger().info('KeyboardInterrupt received, shutting down.')
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 if __name__ == '__main__':
     main()

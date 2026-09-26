@@ -234,7 +234,17 @@ class OffboardControl(Node):
             )
         )
 
-        device_path = self.find_video_device_by_name(args.camera_hint)
+        configured_camera_device = getattr(args, "camera_device", "").strip()
+        device_path = configured_camera_device or self.find_video_device_by_name(args.camera_hint)
+        if configured_camera_device:
+            self.get_logger().info(
+                f"使用配置的广角相机路径: {configured_camera_device} "
+                "(camera hint 仅用于启动前身份校验)"
+            )
+        else:
+            self.get_logger().info(
+                f"未提供广角相机路径，按 camera hint 查找: {args.camera_hint}"
+            )
         self.cap = cv2.VideoCapture(device_path if device_path else 0)
         if not self.cap.isOpened():
             self.get_logger().error("无法打开摄像头！")
@@ -2855,6 +2865,8 @@ def main(args=None) -> None:
                         help='Base directory to save recorded mission videos.')
     parser.add_argument('--camera-hint', type=str, default='imx577',
                         help='Hint to find the camera device name (e.g., "USB", "C920").')
+    parser.add_argument('--camera-device', type=str, default='',
+                        help='Explicit V4L2 device path; when set, do not select the first node by camera hint.')
 
     parser.add_argument('--takeoff-height', type=float, default=-2.1,
                         help='Takeoff height in meters (negative value for altitude).')
