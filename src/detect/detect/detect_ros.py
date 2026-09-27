@@ -35,6 +35,7 @@ class YOLOv5ROS2(Node):
         self.declare_parameter('camera_info_topic', '/camera/camera/color/camera_info')
 
         self.declare_parameter('show_image', False) 
+        self.declare_parameter('publish_debug_image', False)
         # <<< 修改：参数名从 record_depth_video 改为 record_rgb_video，更清晰
         self.declare_parameter('record_rgb_video', False)
         self.declare_parameter('video_output_path', '/home/depth_videos')
@@ -50,6 +51,9 @@ class YOLOv5ROS2(Node):
         camera_info_topic = self.get_parameter('camera_info_topic').get_parameter_value().string_value
 
         self.show_image = self.get_parameter('show_image').get_parameter_value().bool_value
+        self.publish_debug_image = self.get_parameter(
+            'publish_debug_image'
+        ).get_parameter_value().bool_value
         # <<< 修改：获取新参数，并使用新变量名 self.record_rgb
         self.record_rgb = self.get_parameter('record_rgb_video').get_parameter_value().bool_value
         self.video_path = self.get_parameter('video_output_path').get_parameter_value().string_value
@@ -106,6 +110,11 @@ class YOLOv5ROS2(Node):
             qos_profile_observation,
         )
         self.centerHeight_Pub = self.create_publisher(Float32, '/current_height', 10)
+        self.debug_image_publisher = None
+        if self.publish_debug_image:
+            self.debug_image_publisher = self.create_publisher(
+                Image, '/detect/debug/image', qos_profile_sensor_data
+            )
 
         # --- 模型加载 ---
         self.model = YOLO(weights_path)
@@ -215,6 +224,7 @@ class YOLOv5ROS2(Node):
                     color_msg.header,
                     frame_received_at,
                 ),
+                color_msg.header,
             )
         except Exception as e:
             self.get_logger().error(f"Failed to process synced images: {e}")
@@ -256,6 +266,7 @@ class YOLOv5ROS2(Node):
         depth_image,
         depth_encoding='',
         observation_header=None,
+        color_header=None,
     ):
         # --- (可选) 视频录制 ---
         # <<< 修改：整个录制逻辑现在针对 color_image
@@ -333,10 +344,26 @@ class YOLOv5ROS2(Node):
 
         selected = choose_highest_confidence_candidate(candidates)
 
-        # --- (可选) 调试显示 ---
-        if self.show_image:
-            selected_index = None if selected is None else selected['target_index']
-            self.show_detections(color_image.copy(), results, selected_index)
+        # --- (可选) 调试图像；使用原始 RGB 时间戳与 viewer 缓存帧匹配 ---
+        if self.show_image or self.publish_debug_image:
+            try:
+                selected_index = None if selected is None else selected['target_index']
+                annotated_image = self.draw_detections(
+                    color_image.copy(), results, selected_index
+                )
+                if self.publish_debug_image and color_header is not None:
+                    debug_msg = self.bridge.cv2_to_imgmsg(
+                        annotated_image, encoding='bgr8'
+                    )
+                    debug_msg.header = color_header
+                    self.debug_image_publisher.publish(debug_msg)
+                if self.show_image:
+                    self.show_detections(annotated_image)
+            except Exception as exc:
+                self.get_logger().warn(
+                    f"Failed to render debug image: {exc}",
+                    throttle_duration_sec=2,
+                )
 
         if selected is not None:
             X, Y, Z = self.pixel_to_world(
@@ -352,7 +379,7 @@ class YOLOv5ROS2(Node):
                 observation_header,
             )
 
-    def show_detections(self, image, detections, selected_index=None):
+    def draw_detections(self, image, detections, selected_index=None):
         for index, det in enumerate(detections):
             x1, y1, x2, y2, conf, cls = det
             class_name = self.model.names[int(cls)] if hasattr(self.model, "names") else str(int(cls))
@@ -369,6 +396,9 @@ class YOLOv5ROS2(Node):
                 color,
                 2
             )
+        return image
+
+    def show_detections(self, image):
         cv2.imshow("Detection", image)
         cv2.waitKey(1)
 
