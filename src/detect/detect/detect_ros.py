@@ -320,6 +320,8 @@ class YOLOv5ROS2(Node):
         candidates = []
         for index, result in enumerate(results):
             x1, y1, x2, y2, conf, cls = result
+            if int(cls) != 0:
+                continue
             center_x_pixel = int((x1 + x2) / 2)
             center_y_pixel = int((y1 + y2) / 2)
             depth = self.get_robust_depth(
