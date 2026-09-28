@@ -7,6 +7,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# Device-specific TensorRT export artifacts are not portable across machines.
+*.engine
+
 *.bag
 *.db3
 *.mcap
