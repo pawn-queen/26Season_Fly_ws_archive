@@ -406,6 +406,7 @@ class OffboardControl(Node):
         self.target_anchor_tracker = TargetAnchorTracker(
             confidence_window_s=args.target_confidence_window,
             hold_duration_s=args.target_anchor_hold_duration,
+            selection_mode=args.target_anchor_mode,
         )
         self.target_anchor_jump_pending = False
         self.target_anchor_reset_state = None
@@ -2883,7 +2884,11 @@ def main(args=None) -> None:
     parser.add_argument('--target-timeout-duration', type=float, default=1.2,
                         help='最新目标观测保持 fresh 的时长（秒）。')
     parser.add_argument('--target-confidence-window', type=float, default=4.0,
-                        help='选择最高置信度目标观测的滚动时间窗（秒）。')
+                        help='目标锚点候选观测的滚动时间窗（秒）。')
+    parser.add_argument('--target-anchor-mode',
+                        choices=('max-confidence', 'top25'),
+                        default='max-confidence',
+                        help='目标锚点策略：单个最高置信度观测，或最高25%%观测的坐标中位数。')
     parser.add_argument('--target-anchor-hold-duration', type=float, default=2.5,
                         help='丢失新观测后仍朝固定世界目标移动的最长时间（秒）。')
     parser.add_argument('--target-pose-max-skew', type=float, default=0.20,
@@ -3146,6 +3151,7 @@ def main(args=None) -> None:
     print("------------------ 对准阈值 ------------------")
     print(f"  - 首次对准稳定阈值: {custom_args.first_align_threshold} 米, 稳定时长: {custom_args.first_align_time_window} 秒")
     print(f"  - 第二次对准稳定阈值: {custom_args.second_align_threshold} 米, 稳定时长: {custom_args.second_align_time_window} 秒")
+    print(f"  - 目标锚点策略: {custom_args.target_anchor_mode}, 时间窗口: {custom_args.target_confidence_window} 秒")
     print("------------------ 模式设置 ------------------")
     print(f"  - 视频录制: {'已启用' if custom_args.record_video else '已禁用'}")
     print(f"  - 无头模式 (不显示GUI): {'是' if custom_args.headless else '否'}")
