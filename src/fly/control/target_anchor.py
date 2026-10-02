@@ -2,20 +2,27 @@
 
 from collections import deque
 import math
+from statistics import median
 
 
 class TargetAnchorTracker:
     """
-    Keep the highest-confidence recent target as a fixed NED anchor.
+    Select recent confidence-bearing targets as a fixed NED anchor.
 
     The controller converts each *new* camera observation to NED before adding
     it here.  Reusing the resulting world point prevents an old camera-relative
     vector from moving with the aircraft while it is being blown or commanded
-    horizontally.
+    horizontally.  By default the highest-confidence observation wins; the
+    optional top25 mode uses the coordinate-wise median of the top quartile.
     """
 
-    def __init__(self, confidence_window_s=4.0, hold_duration_s=2.5):
-        """Initialize the selection window and short target-loss hold time."""
+    def __init__(
+        self,
+        confidence_window_s=4.0,
+        hold_duration_s=2.5,
+        selection_mode="max-confidence",
+    ):
+        """Initialize the selection mode, window, and target-loss hold time."""
         confidence_window_s = float(confidence_window_s)
         hold_duration_s = float(hold_duration_s)
         if (
@@ -25,9 +32,14 @@ class TargetAnchorTracker:
             raise ValueError("confidence_window_s must be positive")
         if not math.isfinite(hold_duration_s) or hold_duration_s < 0.0:
             raise ValueError("hold_duration_s must be non-negative")
+        if selection_mode not in ("max-confidence", "top25"):
+            raise ValueError(
+                "selection_mode must be 'max-confidence' or 'top25'"
+            )
 
         self.confidence_window_s = confidence_window_s
         self.hold_duration_s = hold_duration_s
+        self.selection_mode = selection_mode
         self._candidates = deque()
         self.anchor_ned = None
         self.anchor_confidence = None
@@ -55,10 +67,32 @@ class TargetAnchorTracker:
         if not self._candidates:
             return False
 
-        observed_at_s, confidence, target_ned = max(
-            self._candidates,
-            key=lambda candidate: (candidate[1], candidate[0]),
-        )
+        if self.selection_mode == "max-confidence":
+            observed_at_s, confidence, target_ned = max(
+                self._candidates,
+                key=lambda candidate: (candidate[1], candidate[0]),
+            )
+        else:
+            ranked_candidates = sorted(
+                self._candidates,
+                key=lambda candidate: (candidate[1], candidate[0]),
+                reverse=True,
+            )
+            selected_count = max(
+                1,
+                math.ceil(len(ranked_candidates) * 0.25),
+            )
+            selected_candidates = ranked_candidates[:selected_count]
+            observed_at_s = max(
+                candidate[0] for candidate in selected_candidates
+            )
+            confidence = median(
+                candidate[1] for candidate in selected_candidates
+            )
+            target_ned = tuple(
+                median(candidate[2][axis] for candidate in selected_candidates)
+                for axis in range(3)
+            )
         old_anchor = self.anchor_ned
         self.anchor_ned = target_ned
         self.anchor_confidence = confidence
@@ -69,9 +103,9 @@ class TargetAnchorTracker:
         """
         Add one NED observation and return whether the selected anchor changed.
 
-        A finite confidence participates in the rolling highest-confidence
-        selection.  ``None`` preserves compatibility with the legacy Point-only
-        topic by making that observation the current anchor directly.
+        A finite confidence participates in the configured rolling selection.
+        ``None`` preserves compatibility with the legacy Point-only topic by
+        making that observation the current anchor directly.
         """
         observed_at_s = float(observed_at_s)
         if not math.isfinite(observed_at_s):

@@ -278,6 +278,8 @@ class OffboardControl(Node):
         self.smoothing_speed = args.smoothing_speed
         self.min_smoothing_duration = args.min_smoothing_duration
         self.max_smoothing_duration = args.max_smoothing_duration
+        self.enable_smooth_transit = args.enable_smooth_transit == 'true'
+        self.smooth_transit_to_recon_started = False
         self.get_logger().info(f"平滑移动速度配置为: {self.smoothing_speed} m/s "
                             f"(持续时间范围: {self.min_smoothing_duration}s - {self.max_smoothing_duration}s)")
 
@@ -396,6 +398,7 @@ class OffboardControl(Node):
         self.target_anchor_tracker = TargetAnchorTracker(
             confidence_window_s=args.target_confidence_window,
             hold_duration_s=args.target_anchor_hold_duration,
+            selection_mode=args.target_anchor_mode,
         )
         self.target_anchor_jump_pending = False
         self.target_anchor_reset_state = None
@@ -1138,7 +1141,10 @@ class OffboardControl(Node):
         """
         # 1. 持续发布飞向预定目标点的指令
         # 目标高度保持在起飞高度
-        self.publish_position_setpoint(self.DropArea_x, self.DropArea_y, self.takeoff_target_height)
+        if self.enable_smooth_transit and self.is_smoothing_descent:
+            self._publish_smooth_move_setpoint()
+        else:
+            self.publish_position_setpoint(self.DropArea_x, self.DropArea_y, self.takeoff_target_height)
 
         # 2. 检查是否已经到达
         current_x = self.vehicle_local_position.x
@@ -1152,6 +1158,8 @@ class OffboardControl(Node):
                                    f"距离误差: {error:.2f} m")
 
         if error < self.nav_threshold:
+            if self.enable_smooth_transit:
+                self.is_smoothing_descent = False
             self.is_AtDropArea = True
             self.get_logger().info("已到达投水区！")
 
@@ -1508,6 +1516,17 @@ class OffboardControl(Node):
         # 6. 重置计数器并激活平滑移动标志
         self.smoothing_step_counter = 0
         self.is_smoothing_descent = True # 使用相同的标志位
+
+    def _publish_smooth_move_setpoint(self):
+        progress = min(self.smoothing_step_counter / self.smoothing_total_steps, 1.0)
+        start = self.smoothing_start_pos
+        end = self.smoothing_end_pos
+        self.publish_position_setpoint(*(
+            start[i] + (end[i] - start[i]) * progress for i in range(3)
+        ))
+        self.smoothing_step_counter += 1
+        if self.smoothing_step_counter > self.smoothing_total_steps:
+            self.is_smoothing_descent = False
 
     def adjust_to_target(self):
         """Adjust drone position towards the current target."""
@@ -2257,6 +2276,8 @@ class OffboardControl(Node):
                     self.get_logger().info("执行步骤3, 计算投水区位置并开始导航...")
                     self.calculate_drop_area_once(self.forward_x)
                     self.is_drop_area_calculated = True
+                    if self.enable_smooth_transit:
+                        self._start_smooth_move((self.DropArea_x, self.DropArea_y, self.takeoff_target_height))
 
                 # 步骤2: 持续导航并检查是否到达
                 self.navigate_to_drop_area()
@@ -2487,15 +2508,23 @@ class OffboardControl(Node):
                         target_recon_x_frd,
                         target_recon_y_frd
                     )
+                    if self.enable_smooth_transit and not self.smooth_transit_to_recon_started:
+                        self._start_smooth_move((target_recon_x_ned, target_recon_y_ned, self.takeoff_target_height))
+                        self.smooth_transit_to_recon_started = True
 
                     self.get_logger().info(f"将从当前位置向前飞 {self.recon_forward_distance}m, "
                                        f"目标侦察区 (NED): ({target_recon_x_ned:.2f}, {target_recon_y_ned:.2f})")
 
-                    self.publish_position_setpoint(target_recon_x_ned, target_recon_y_ned, self.takeoff_target_height)
+                    if self.enable_smooth_transit and self.is_smoothing_descent:
+                        self._publish_smooth_move_setpoint()
+                    else:
+                        self.publish_position_setpoint(target_recon_x_ned, target_recon_y_ned, self.takeoff_target_height)
 
                     error = math.sqrt((self.vehicle_local_position.x-target_recon_x_ned)**2+(self.vehicle_local_position.y-target_recon_y_ned)**2)
                     if error < 0.5 :
                     # 3. 切换到新的状态
+                        if self.enable_smooth_transit:
+                            self.is_smoothing_descent = False
                         self.mission_state = MissionState.TRANSIT_TO_RECON_OFFBOARD
                     else:
                         return
@@ -2863,6 +2892,8 @@ def main(args=None) -> None:
 
     parser.add_argument('--forward-x', type=float, default=32.5,
                         help='Forward distance to fly to the drop area in meters.')
+    parser.add_argument('--enable-smooth-transit', choices=('true', 'false'), default='false',
+                        help='Use smooth setpoints for transit to drop and recon areas (default: false).')
     parser.add_argument('--search-height', type=float, default=-5.0,
                         help='Global search height in meters (negative value for altitude).')
 
@@ -2871,7 +2902,11 @@ def main(args=None) -> None:
     parser.add_argument('--target-timeout-duration', type=float, default=1.2,
                         help='最新目标观测保持 fresh 的时长（秒）。')
     parser.add_argument('--target-confidence-window', type=float, default=4.0,
-                        help='选择最高置信度目标观测的滚动时间窗（秒）。')
+                        help='目标锚点候选观测的滚动时间窗（秒）。')
+    parser.add_argument('--target-anchor-mode',
+                        choices=('max-confidence', 'top25'),
+                        default='max-confidence',
+                        help='目标锚点策略：单个最高置信度观测，或最高25%%观测的坐标中位数。')
     parser.add_argument('--target-anchor-hold-duration', type=float, default=2.5,
                         help='丢失新观测后仍朝固定世界目标移动的最长时间（秒）。')
     parser.add_argument('--target-pose-max-skew', type=float, default=0.20,
@@ -3134,6 +3169,7 @@ def main(args=None) -> None:
     print("------------------ 对准阈值 ------------------")
     print(f"  - 首次对准稳定阈值: {custom_args.first_align_threshold} 米, 稳定时长: {custom_args.first_align_time_window} 秒")
     print(f"  - 第二次对准稳定阈值: {custom_args.second_align_threshold} 米, 稳定时长: {custom_args.second_align_time_window} 秒")
+    print(f"  - 目标锚点策略: {custom_args.target_anchor_mode}, 时间窗口: {custom_args.target_confidence_window} 秒")
     print("------------------ 模式设置 ------------------")
     print(f"  - 视频录制: {'已启用' if custom_args.record_video else '已禁用'}")
     print(f"  - 无头模式 (不显示GUI): {'是' if custom_args.headless else '否'}")

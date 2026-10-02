@@ -214,7 +214,10 @@ class VisualServoingController:
             boxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
             ids = results[0].boxes.id.cpu().numpy().astype(int)
             confs = results[0].boxes.conf.cpu().numpy()
-            for box, track_id, conf in zip(boxes, ids, confs):
+            classes = results[0].boxes.cls.cpu().numpy().astype(int)
+            for box, track_id, conf, cls in zip(boxes, ids, confs, classes):
+                if cls != 0:
+                    continue
                 if conf > self.CONFIDENCE_THRESHOLD:
                     cx = int((box[0] + box[2]) / 2)
                     cy = int((box[1] + box[3]) / 2)
