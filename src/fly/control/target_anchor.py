@@ -1,8 +1,18 @@
 """Confidence-aware world-frame target anchoring for horizontal alignment."""
 
 from collections import deque
+from dataclasses import dataclass
 import math
 from statistics import median
+
+
+@dataclass(frozen=True)
+class ObservationResult:
+    """Outcome of ingesting a point, independent of whether its anchor won."""
+
+    accepted: bool
+    anchor_changed: bool
+    lock_acquired: bool = False
 
 
 class TargetAnchorTracker:
@@ -21,6 +31,7 @@ class TargetAnchorTracker:
         confidence_window_s=4.0,
         hold_duration_s=2.5,
         selection_mode="max-confidence",
+        lock_enabled=False,
     ):
         """Initialize the selection mode, window, and target-loss hold time."""
         confidence_window_s = float(confidence_window_s)
@@ -40,6 +51,8 @@ class TargetAnchorTracker:
         self.confidence_window_s = confidence_window_s
         self.hold_duration_s = hold_duration_s
         self.selection_mode = selection_mode
+        self.lock_enabled = lock_enabled
+        self.lock_ned = None
         self._candidates = deque()
         self.anchor_ned = None
         self.anchor_confidence = None
@@ -99,40 +112,88 @@ class TargetAnchorTracker:
         self.anchor_observed_at_s = observed_at_s
         return old_anchor != self.anchor_ned
 
+    def _update_lock(self):
+        if self.lock_enabled and self._candidates:
+            self.lock_ned = max(
+                self._candidates,
+                key=lambda candidate: (candidate[1], candidate[0]),
+            )[2]
+        else:
+            self.lock_ned = None
+
     def add_observation(self, target_ned, observed_at_s, confidence=None):
         """
         Add one NED observation and return whether the selected anchor changed.
 
         A finite confidence participates in the configured rolling selection.
-        ``None`` preserves compatibility with the legacy Point-only topic by
-        making that observation the current anchor directly.
+        When unlocked, ``None`` preserves compatibility with the legacy
+        Point-only topic by making that observation the current anchor directly.
+        Use ingest_observation() when acceptance must be distinguished from an
+        unchanged anchor.
+        """
+        return self.ingest_observation(
+            target_ned, observed_at_s, confidence
+        ).anchor_changed
+
+    def ingest_observation(
+        self, target_ned, observed_at_s, confidence=None, now_s=None
+    ):
+        """Return acceptance separately from anchor changes and lock acquisition.
+
+        Locked observations are gated against the pre-insertion max-confidence
+        point in the same rolling pool. Expiry uses current time, not arrival's
+        image timestamp. Rejected points never renew the accepted observation age.
         """
         observed_at_s = float(observed_at_s)
         if not math.isfinite(observed_at_s):
             raise ValueError("observed_at_s must be finite")
         target_ned = self._validated_ned(target_ned)
-        self.last_observation_at_s = observed_at_s
 
         if confidence is None:
+            if self.lock_enabled:
+                return ObservationResult(False, False)
+            self.last_observation_at_s = observed_at_s
             old_anchor = self.anchor_ned
             self._candidates.clear()
             self.anchor_ned = target_ned
             self.anchor_confidence = None
             self.anchor_observed_at_s = observed_at_s
-            return old_anchor != self.anchor_ned
+            return ObservationResult(True, old_anchor != self.anchor_ned)
 
         confidence = float(confidence)
         if not math.isfinite(confidence):
             raise ValueError("confidence must be finite or None")
 
+        lock_acquired = False
+        if self.lock_enabled:
+            now_s = observed_at_s if now_s is None else float(now_s)
+            if not math.isfinite(now_s):
+                raise ValueError("now_s must be finite")
+            self._prune(now_s)
+            self._update_lock()
+            if (
+                observed_at_s < now_s - self.confidence_window_s
+                or observed_at_s > now_s
+            ):
+                return ObservationResult(False, False)
+            if self.lock_ned is not None and math.hypot(
+                target_ned[0] - self.lock_ned[0],
+                target_ned[1] - self.lock_ned[1],
+            ) > 1.0:
+                return ObservationResult(False, False)
+            lock_acquired = self.lock_ned is None
+
+        self.last_observation_at_s = observed_at_s
         self._candidates.append((observed_at_s, confidence, target_ned))
         self._prune(observed_at_s)
-        return self._select_best_candidate()
+        self._update_lock()
+        return ObservationResult(True, self._select_best_candidate(), lock_acquired)
 
     def refresh(self, now_s):
         """Expire old candidates; return whether selected anchor changed."""
         now_s = float(now_s)
         self._prune(now_s)
+        self._update_lock()
         return self._select_best_candidate()
 
     def is_active(self, now_s):
@@ -154,6 +215,7 @@ class TargetAnchorTracker:
     def reset(self):
         """Clear all candidates and the selected anchor."""
         self._candidates.clear()
+        self.lock_ned = None
         self.anchor_ned = None
         self.anchor_confidence = None
         self.anchor_observed_at_s = None

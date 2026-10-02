@@ -409,6 +409,7 @@ class OffboardControl(Node):
             confidence_window_s=args.target_confidence_window,
             hold_duration_s=args.target_anchor_hold_duration,
             selection_mode=args.target_anchor_mode,
+            lock_enabled=args.lock_enabled == 'true',
         )
         self.target_anchor_jump_pending = False
         self.target_anchor_reset_state = None
@@ -623,6 +624,8 @@ class OffboardControl(Node):
         """Validate one camera observation and immediately anchor it in NED."""
         if not self.is_final_aligning:
             return
+        if self.target_anchor_tracker.lock_enabled and confidence is None:
+            return
         values = (x, y, z)
         if not all(math.isfinite(value) for value in values) or z <= 0.0:
             self.get_logger().warn(
@@ -668,6 +671,7 @@ class OffboardControl(Node):
             )
             return
         receive_gap_s = None
+        accepted_stream_gap = False
         if self.last_target_update_time is not None:
             receive_gap_s = (
                 now - self.last_target_update_time
@@ -677,8 +681,11 @@ class OffboardControl(Node):
                 self.last_target_measurement_time_s = None
                 self.target_stream_discontinuity_pending = True
             elif receive_gap_s > self.target_timeout_duration:
-                self.target_anchor_tracker.reset()
-                self.target_stream_discontinuity_pending = True
+                if self.target_anchor_tracker.lock_enabled:
+                    accepted_stream_gap = True
+                else:
+                    self.target_anchor_tracker.reset()
+                    self.target_stream_discontinuity_pending = True
 
         if self.last_target_measurement_time_s is not None:
             measurement_gap_s = (
@@ -691,8 +698,11 @@ class OffboardControl(Node):
                 )
                 return
             if measurement_gap_s > self.target_timeout_duration:
-                self.target_anchor_tracker.reset()
-                self.target_stream_discontinuity_pending = True
+                if self.target_anchor_tracker.lock_enabled:
+                    accepted_stream_gap = True
+                else:
+                    self.target_anchor_tracker.reset()
+                    self.target_stream_discontinuity_pending = True
 
         if (
             self.target_anchor_reset_state is not None
@@ -701,11 +711,22 @@ class OffboardControl(Node):
             self.target_anchor_tracker.reset()
             self.target_stream_discontinuity_pending = True
         old_anchor = self.target_anchor_tracker.anchor_ned
-        self.target_anchor_tracker.add_observation(
+        result = self.target_anchor_tracker.ingest_observation(
             target_ned,
             observed_at_s=observation_time_s,
             confidence=confidence,
+            now_s=now_s,
         )
+        if not result.accepted:
+            self.get_logger().info(
+                "目标观测未通过NED锁定过滤，等待锁内有效观测。",
+                throttle_duration_sec=2,
+            )
+            return
+        if result.lock_acquired or accepted_stream_gap:
+            # The control loop clears alignment timers and PID history before
+            # using the newly acquired/recovered observation.
+            self.target_stream_discontinuity_pending = True
         self.target_anchor_reset_state = reset_state
         new_anchor = self.target_anchor_tracker.anchor_ned
         if old_anchor is not None and new_anchor is not None:
@@ -762,6 +783,8 @@ class OffboardControl(Node):
 
     def target_position_callback(self, msg: Point):
         """Fallback for detectors that only publish the legacy Point topic."""
+        if self.target_anchor_tracker.lock_enabled:
+            return
         now = self.get_clock().now()
         if self.last_confident_target_update_time is not None:
             structured_age_s = (
@@ -2919,6 +2942,8 @@ def main(args=None) -> None:
                         choices=('max-confidence', 'top25'),
                         default='max-confidence',
                         help='目标锚点策略：单个最高置信度观测，或最高25%%观测的坐标中位数。')
+    parser.add_argument('--lock-enabled', choices=('true', 'false'), default='false',
+                        help='启用NED水平1米目标锁；生命周期复用目标置信度窗口（默认关闭）。')
     parser.add_argument('--target-anchor-hold-duration', type=float, default=2.5,
                         help='丢失新观测后仍朝固定世界目标移动的最长时间（秒）。')
     parser.add_argument('--target-pose-max-skew', type=float, default=0.20,
@@ -3182,6 +3207,7 @@ def main(args=None) -> None:
     print(f"  - 首次对准稳定阈值: {custom_args.first_align_threshold} 米, 稳定时长: {custom_args.first_align_time_window} 秒")
     print(f"  - 第二次对准稳定阈值: {custom_args.second_align_threshold} 米, 稳定时长: {custom_args.second_align_time_window} 秒")
     print(f"  - 目标锚点策略: {custom_args.target_anchor_mode}, 时间窗口: {custom_args.target_confidence_window} 秒")
+    print(f"  - NED目标锁定: {'已启用' if custom_args.lock_enabled == 'true' else '已禁用'}")
     print("------------------ 模式设置 ------------------")
     print(f"  - 视频录制: {'已启用' if custom_args.record_video else '已禁用'}")
     print(f"  - 无头模式 (不显示GUI): {'是' if custom_args.headless else '否'}")
