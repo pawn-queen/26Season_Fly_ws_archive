@@ -6,7 +6,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition, VehicleStatus, VehicleOdometry
 from geometry_msgs.msg import Point
 from std_msgs.msg import Float32
-from sensor_msgs.msg import PointCloud
+from sensor_msgs.msg import Image, PointCloud
 from collections import deque
 import time
 from control.DronePositionChecker import DronePositionChecker
@@ -92,6 +92,7 @@ class OffboardControl(Node):
         self.vision_callback_group = MutuallyExclusiveCallbackGroup()
         self.heartbeat_callback_group = MutuallyExclusiveCallbackGroup()
         self.image_callback_group = MutuallyExclusiveCallbackGroup()
+        self.widecam_debug_callback_group = MutuallyExclusiveCallbackGroup()
 
         # 多线程执行器下，共享数据必须以完整快照为单位交换。
         self._pose_lock = threading.Lock()
@@ -107,6 +108,10 @@ class OffboardControl(Node):
             TrajectorySetpoint, '/fmu/in/trajectory_setpoint', qos_profile)
         self.vehicle_command_publisher = self.create_publisher(
             VehicleCommand, '/fmu/in/vehicle_command', qos_profile)
+        self.widecam_raw_publisher = self.create_publisher(
+            Image, '/control/widecam/image_raw', target_qos_profile)
+        self.widecam_debug_publisher = self.create_publisher(
+            Image, '/control/widecam/debug_image', target_qos_profile)
 
         # Create subscribers
         self.vehicle_local_position_subscriber = self.create_subscription(
@@ -485,6 +490,15 @@ class OffboardControl(Node):
         self.vision_epoch = 0
         self.vision_reset_applied_epoch = 0
         self.recon_started_monotonic_ns = None
+        self.latest_widecam_debug_snapshot = None
+        self._widecam_last_raw_sequence = None
+        self._widecam_last_debug_key = None
+        self._widecam_last_debug_phase = None
+        self.widecam_debug_timer = self.create_timer(
+            0.1,
+            self.widecam_debug_timer_callback,
+            callback_group=self.widecam_debug_callback_group,
+        )
         # 起飞高度判断阈值
         self.takeoff_threshold = args.takeoff_threshold
         # 向前飞行到达点阈值
@@ -2748,6 +2762,7 @@ class OffboardControl(Node):
             self.latest_vision_frame_sequence = -1
             self.latest_vision_mission_state = None
             self.latest_annotated_frame = None
+            self.latest_widecam_debug_snapshot = None
             self.current_vision_info = []
             self.recon_started_monotonic_ns = None
             self.mission_state = MissionState.RETURN_TO_CENTER_DROPAREA
@@ -2816,6 +2831,106 @@ class OffboardControl(Node):
                 f"OpenCV窗口不可用，后续自动无头运行: {exc}"
             )
 
+    def _make_widecam_image(self, frame, ros_time_ns):
+        """Pack an immutable BGR snapshot without a cv_bridge dependency."""
+        if frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError("Wide-camera debug images must be uint8 BGR frames")
+        contiguous_frame = np.ascontiguousarray(frame)
+        message = Image()
+        message.header.stamp.sec, message.header.stamp.nanosec = divmod(
+            int(ros_time_ns), 1_000_000_000
+        )
+        message.header.frame_id = 'wide_camera_optical_frame'
+        message.height, message.width = contiguous_frame.shape[:2]
+        message.encoding = 'bgr8'
+        message.is_bigendian = 0
+        message.step = message.width * 3
+        message.data = contiguous_frame.tobytes()
+        return message
+
+    def widecam_debug_timer_callback(self):
+        """Publish existing camera/inference snapshots only while observed."""
+        try:
+            raw_requested = self.widecam_raw_publisher.get_subscription_count() > 0
+            debug_requested = self.widecam_debug_publisher.get_subscription_count() > 0
+            if not raw_requested and not debug_requested:
+                return
+
+            now_ns = time.monotonic_ns()
+            # Captured/annotated arrays are immutable after their snapshot is
+            # installed. Only references and metadata are copied under locks.
+            with self._frame_lock:
+                raw_frame = self.latest_frame
+                raw_sequence = self.latest_frame_sequence
+                raw_ros_time_ns = self.latest_frame_received_time_ns
+            if raw_frame is None or raw_ros_time_ns is None:
+                return
+            with self._vision_result_lock:
+                state = self.mission_state
+                epoch = self.vision_epoch
+                applied_epoch = self.vision_reset_applied_epoch
+                annotation = self.latest_widecam_debug_snapshot
+
+            raw_message = None
+            if raw_requested and raw_sequence != self._widecam_last_raw_sequence:
+                raw_message = self._make_widecam_image(raw_frame, raw_ros_time_ns)
+                self.widecam_raw_publisher.publish(raw_message)
+                self._widecam_last_raw_sequence = raw_sequence
+
+            if not debug_requested:
+                return
+            phase = (epoch, state, applied_epoch)
+            phase_changed = (
+                self._widecam_last_debug_phase is not None
+                and phase != self._widecam_last_debug_phase
+            )
+            use_annotation = (
+                not phase_changed
+                and state in (MissionState.GLOBAL_SEARCH, MissionState.RECON_SEARCH)
+                and applied_epoch == epoch
+                and annotation is not None
+                and annotation['epoch'] == epoch
+                and annotation['state'] == state
+                and 0 <= now_ns - annotation['monotonic_ns'] <= 1_000_000_000
+            )
+            mode = 'annotated' if use_annotation else 'raw'
+            sequence = annotation['sequence'] if use_annotation else raw_sequence
+            debug_key = (phase, mode, sequence)
+            if debug_key == self._widecam_last_debug_key:
+                return
+            if use_annotation:
+                debug_message = self._make_widecam_image(
+                    annotation['frame'], annotation['ros_time_ns']
+                )
+            else:
+                if raw_message is None:
+                    raw_message = self._make_widecam_image(raw_frame, raw_ros_time_ns)
+                debug_message = raw_message
+
+            # Encoding can overlap a mission transition. Do not send the
+            # obsolete snapshot, and never hold a data lock during publish().
+            with self._vision_result_lock:
+                if (
+                    self.mission_state != state
+                    or self.vision_epoch != epoch
+                    or self.vision_reset_applied_epoch != applied_epoch
+                    or (use_annotation and not (
+                        0 <= time.monotonic_ns() - annotation['monotonic_ns']
+                        <= 1_000_000_000
+                    ))
+                ):
+                    return
+            # All debug sends share this mutually exclusive callback. A raw
+            # replacement therefore follows any already-in-flight old image.
+            self.widecam_debug_publisher.publish(debug_message)
+            self._widecam_last_debug_key = debug_key
+            self._widecam_last_debug_phase = phase
+        except Exception as exc:
+            self.get_logger().warn(
+                f"广角调试图像发布失败，后续自动重试：{exc}",
+                throttle_duration_sec=2,
+            )
+
     def vision_timer_callback(self):
         """Load the model and process only the newest unprocessed USB frame."""
         timer_start = self.get_clock().now()
@@ -2848,6 +2963,8 @@ class OffboardControl(Node):
                 if self.latest_frame_pose_snapshot is not None else None
             )
             frame_read_started_monotonic_ns = self.latest_frame_read_started_monotonic_ns
+            frame_ros_time_ns = self.latest_frame_received_time_ns
+            frame_monotonic_ns = self.latest_frame_monotonic_ns
             self.last_processed_frame_sequence = frame_sequence
 
         if frame_pose is None:
@@ -2921,6 +3038,16 @@ class OffboardControl(Node):
                 self.latest_vision_frame_pose = dict(frame_pose)
                 self.latest_vision_frame_sequence = frame_sequence
                 self.latest_vision_mission_state = mission_state_at_start
+                self.latest_widecam_debug_snapshot = {
+                    'frame': annotated_frame,
+                    'sequence': frame_sequence,
+                    'ros_time_ns': frame_ros_time_ns,
+                    'monotonic_ns': frame_monotonic_ns,
+                    'state': mission_state_at_start,
+                    'epoch': vision_epoch_at_start,
+                }
+            else:
+                self.latest_widecam_debug_snapshot = None
             self.latest_annotated_frame = annotated_frame
 
         if mission_state_at_start == MissionState.GLOBAL_SEARCH:
@@ -2944,8 +3071,8 @@ class OffboardControl(Node):
 
 
 def spin_control_node_safely(node: OffboardControl) -> None:
-    """Run ROS callbacks on four workers while keeping OpenCV GUI on main."""
-    executor = MultiThreadedExecutor(num_threads=4)
+    """Run ROS callbacks on five workers while keeping OpenCV GUI on main."""
+    executor = MultiThreadedExecutor(num_threads=5)
     executor.add_node(node)
     # ServoControl 是另一个 ROS Node；只有加入 executor 后它的订阅回调才会执行。
     executor.add_node(node.servo_control)
