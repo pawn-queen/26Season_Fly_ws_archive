@@ -887,9 +887,9 @@ class OffboardControl(Node):
     def vehicle_status_callback(self, vehicle_status):
         """Callback function for vehicle_status topic subscriber."""
         # ===== 新增：首次收到数据时打印日志 =====
-        if self.vehicle_status.nav_state == 0 and vehicle_status.nav_state != 0:
+        if self.vehicle_status.timestamp == 0 and vehicle_status.timestamp != 0:
             self.get_logger().info(
-                f"飞控已连接! nav_state={vehicle_status.nav_state}, "
+                f"首次收到带有效时间戳的飞控状态: nav_state={vehicle_status.nav_state}, "
                 f"arming_state={vehicle_status.arming_state}"
             )
         self.vehicle_status = vehicle_status
@@ -2227,12 +2227,11 @@ class OffboardControl(Node):
 
         #进入offboard前发布位置控制点
         
-        if self.offboard_setpoint_counter < 100:
+        if (self.offboard_setpoint_counter < 100 and self.vehicle_status.nav_state != VehicleStatus.NAVIGATION_STATE_OFFBOARD):
             # ===== 新增：检查是否收到飞控数据 =====
-            if self.vehicle_status.nav_state == 0 and self.offboard_setpoint_counter == 0:
+            if self.vehicle_status.timestamp == 0 and self.offboard_setpoint_counter == 0:
                 self.get_logger().warn(
-                    "飞控状态尚未收到(nav_state=0)，"
-                    "请确认MicroXRCEAgent已正确启动且DDS桥接正常。"
+                    "尚未收到带有效时间戳的飞控状态，当前模式尚无法确认。"
                 )
     
             self.publish_position_setpoint(
@@ -2243,8 +2242,10 @@ class OffboardControl(Node):
             self.engage_offboard_mode()
             if self.log_counter % 10 == 0:
                 self.get_logger().info(
-                    f"尝试切入offboard(第{self.offboard_setpoint_counter+1}次), "
-                    f"==============向前飞行距离{self.forward_x}m==================="
+                    f"已发送 Offboard 切换请求，等待飞控状态确认 "
+                    f"(启动后第{self.offboard_setpoint_counter+1}个控制周期，"
+                    f"当前 nav_state={self.vehicle_status.nav_state})；"
+                    f"计划向前飞行距离={self.forward_x}m"
                 )
 
         if self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD:
@@ -2694,26 +2695,22 @@ class OffboardControl(Node):
             # 只有在过了初始的切换阶段后才打印日志
             if self.offboard_setpoint_counter >= 10:
                 nav_state_names = {
-                    0: "未连接/未初始化",
-                    1: "MANUAL",
-                    2: "ALTCTL",
-                    3: "POSCTL",
-                    4: "AUTO_MISSION",
-                    5: "AUTO_LOITER",
-                    6: "AUTO_RTL",
-                    10: "ACRO",
-                    14: "OFFBOARD",
-                    17: "AUTO_TAKEOFF",
-                    18: "AUTO_LAND",
+                    value: name.removeprefix("NAVIGATION_STATE_")
+                    for name, value in vars(VehicleStatus).items()
+                    if name.startswith("NAVIGATION_STATE_")
+                    and name != "NAVIGATION_STATE_MAX"
                 }
                 state_name = nav_state_names.get(
                     self.vehicle_status.nav_state,
                     f"未知({self.vehicle_status.nav_state})"
                 )
                 self.get_logger().warn(
-                    f"无人机当前状态: {state_name}，不是预期的 Offboard 模式。"
-                    f"\n  提示: 如果状态为'未连接/未初始化'，说明DDS桥接有问题。"
-                    f"\n  请检查:(1)飞控是否上电 (2)FT232连接 (3)UXRCE_DDS_CFG参数。",
+                    f"当前飞控模式: {state_name} (nav_state={self.vehicle_status.nav_state})，"
+                    f"尚未处于 Offboard。"
+                    + ("仍在发送切换请求。" if self.offboard_setpoint_counter < 100
+                       else "已超过启动切换窗口，当前不再发送切换请求。")
+                    + ("尚未收到带有效时间戳的飞控状态，以上模式值可能是默认值。"
+                       if self.vehicle_status.timestamp == 0 else ""),
                     throttle_duration_sec=5
                 )
 
