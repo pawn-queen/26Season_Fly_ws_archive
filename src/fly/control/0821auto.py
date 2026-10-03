@@ -2227,7 +2227,7 @@ class OffboardControl(Node):
 
         #进入offboard前发布位置控制点
         
-        if self.offboard_setpoint_counter < 10:
+        if self.offboard_setpoint_counter < 100:
             # ===== 新增：检查是否收到飞控数据 =====
             if self.vehicle_status.nav_state == 0 and self.offboard_setpoint_counter == 0:
                 self.get_logger().warn(
