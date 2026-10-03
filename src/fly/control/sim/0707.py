@@ -116,9 +116,11 @@ class OffboardControl(Node):
         self.vision_callback_group = MutuallyExclusiveCallbackGroup()
         self.heartbeat_callback_group = MutuallyExclusiveCallbackGroup()
         self.image_callback_group = MutuallyExclusiveCallbackGroup()
+        self._pose_lock = threading.Lock()
         self._frame_lock = threading.Lock()
         self._vision_result_lock = threading.Lock()
         self._map_data_lock = threading.Lock()
+        self._vision_ready_event = threading.Event()
         self.offboard_heartbeat_enabled = False
 
         # Create publishers
@@ -331,6 +333,8 @@ class OffboardControl(Node):
         self.smoothing_speed = args.smoothing_speed
         self.min_smoothing_duration = args.min_smoothing_duration
         self.max_smoothing_duration = args.max_smoothing_duration
+        self.enable_smooth_transit = args.enable_smooth_transit == 'true'
+        self.smooth_transit_to_recon_started = False
         self.get_logger().info(f"平滑移动速度配置为: {self.smoothing_speed} m/s "
                             f"(持续时间范围: {self.min_smoothing_duration}s - {self.max_smoothing_duration}s)")
 
@@ -412,6 +416,7 @@ class OffboardControl(Node):
         self.first_align_start_timestamp = None
         self.first_align_accumulated_s = 0.0
         self.second_align_accumulated_s = 0.0
+        self.timeout_2nd_postdrop = None
         
         self.timeout_drop_start_time = None
         
@@ -452,6 +457,7 @@ class OffboardControl(Node):
         self.target_anchor_tracker = TargetAnchorTracker(
             confidence_window_s=args.target_confidence_window,
             hold_duration_s=args.target_anchor_hold_duration,
+            selection_mode=args.target_anchor_mode,
         )
         self.target_anchor_jump_pending = False
         self.target_anchor_reset_state = None
@@ -464,6 +470,7 @@ class OffboardControl(Node):
         self.world_target_coordinates_ned = {}
         self.widecam_map_reset_state = None
         self.widecam_local_reference_warned = False
+        self.global_map_accepting_samples = False
 
         #==================投水状态机=================
         self.servo_step_delay = args.servo_step_delay  # 每个舵机动作之间的延迟（秒），可以根据实际情况调整
@@ -542,6 +549,9 @@ class OffboardControl(Node):
         # 创建一个线程安全的变量来存储视觉结果
         self.latest_vision_info = []
         self.latest_annotated_frame = None
+        self.latest_vision_frame_pose = None
+        self.latest_vision_frame_sequence = -1
+        self.latest_vision_mission_state = None
         # 起飞高度判断阈值
         self.takeoff_threshold = args.takeoff_threshold
         # 向前飞行到达点阈值
@@ -867,7 +877,8 @@ class OffboardControl(Node):
 
     def vehicle_local_position_callback(self, vehicle_local_position):
         """Callback function for vehicle_local_position topic subscriber."""
-        self.vehicle_local_position = vehicle_local_position
+        with self._pose_lock:
+            self.vehicle_local_position = vehicle_local_position
         current_reset_state = self._local_position_reset_state()
         if (
             self.is_final_aligning
@@ -885,14 +896,18 @@ class OffboardControl(Node):
 
     def _capture_widecam_pose_snapshot(self):
         """Capture a pose that is safe to associate with one camera frame."""
-        position = self.vehicle_local_position
+        with self._pose_lock:
+            position = self.vehicle_local_position
+            vehicle_roll = self.vehicle_roll
+            vehicle_pitch = self.vehicle_pitch
+            attitude_timestamp_us = self.vehicle_attitude_timestamp_us
         values = (
             position.x,
             position.y,
             position.z,
             position.heading,
-            self.vehicle_roll,
-            self.vehicle_pitch,
+            vehicle_roll,
+            vehicle_pitch,
         )
         if not all(math.isfinite(value) for value in values):
             return None
@@ -909,11 +924,11 @@ class OffboardControl(Node):
         timestamp_us = (
             getattr(position, 'timestamp_sample', 0) or getattr(position, 'timestamp', 0)
         )
-        if self.vehicle_attitude_timestamp_us is None:
+        if attitude_timestamp_us is None:
             return None
         if (
             timestamp_us and
-            abs(timestamp_us - self.vehicle_attitude_timestamp_us) > self.widecam_pose_attitude_skew_us
+            abs(timestamp_us - attitude_timestamp_us) > self.widecam_pose_attitude_skew_us
         ):
             return None
 
@@ -925,8 +940,8 @@ class OffboardControl(Node):
             'y': float(position.y),
             'z': float(position.z),
             'yaw': float(position.heading),
-            'roll': float(self.vehicle_roll),
-            'pitch': float(self.vehicle_pitch),
+            'roll': float(vehicle_roll),
+            'pitch': float(vehicle_pitch),
             'horizontal_speed': horizontal_speed,
             'timestamp_us': timestamp_us,
             'reset_state': (
@@ -954,12 +969,13 @@ class OffboardControl(Node):
         q /= np.linalg.norm(q)
         
         # 从四元数转换为欧拉角 (roll, pitch, yaw)，单位是弧度
-        (self.vehicle_roll, 
-         self.vehicle_pitch, 
-         _) = R.from_quat(q).as_euler('xyz', degrees=False)
-        self.vehicle_attitude_timestamp_us = (
-            getattr(msg, 'timestamp_sample', 0) or getattr(msg, 'timestamp', 0)
-        )
+        vehicle_roll, vehicle_pitch, _ = R.from_quat(q).as_euler('xyz', degrees=False)
+        with self._pose_lock:
+            self.vehicle_roll = vehicle_roll
+            self.vehicle_pitch = vehicle_pitch
+            self.vehicle_attitude_timestamp_us = (
+                getattr(msg, 'timestamp_sample', 0) or getattr(msg, 'timestamp', 0)
+            )
         # Yaw我们继续使用更稳定的 vehicle_local_position.heading
 
 
@@ -1508,7 +1524,10 @@ class OffboardControl(Node):
         """
         # 1. 持续发布飞向预定目标点的指令
         # 目标高度保持在起飞高度
-        self.publish_position_setpoint(self.DropArea_x, self.DropArea_y, self.takeoff_target_height)
+        if self.enable_smooth_transit and self.is_smoothing_descent:
+            self._publish_smooth_move_setpoint()
+        else:
+            self.publish_position_setpoint(self.DropArea_x, self.DropArea_y, self.takeoff_target_height)
 
         # 2. 检查是否已经到达
         current_x = self.vehicle_local_position.x
@@ -1522,6 +1541,8 @@ class OffboardControl(Node):
                                    f"距离误差: {error:.2f} m")
 
         if error < self.nav_threshold:
+            if self.enable_smooth_transit:
+                self.is_smoothing_descent = False
             self.is_AtDropArea = True
             self.get_logger().info("已到达投水区！")
     
@@ -1742,6 +1763,17 @@ class OffboardControl(Node):
         # 6. 重置计数器并激活平滑移动标志
         self.smoothing_step_counter = 0
         self.is_smoothing_descent = True # 使用相同的标志位
+
+    def _publish_smooth_move_setpoint(self):
+        progress = min(self.smoothing_step_counter / self.smoothing_total_steps, 1.0)
+        start = self.smoothing_start_pos
+        end = self.smoothing_end_pos
+        self.publish_position_setpoint(*(
+            start[i] + (end[i] - start[i]) * progress for i in range(3)
+        ))
+        self.smoothing_step_counter += 1
+        if self.smoothing_step_counter > self.smoothing_total_steps:
+            self.is_smoothing_descent = False
 
     def adjust_to_target(self):
         """Adjust drone position towards the current target."""
@@ -2345,7 +2377,7 @@ class OffboardControl(Node):
         self.get_logger().info("最终任务地图构建完成。")
     
 
-    def _build_recon_mission_map(self, named_targets_frd):
+    def _build_recon_mission_map(self, named_targets_frd, sample_pose=None):
         """
         为侦察阶段构建任务地图。
         """
@@ -2358,7 +2390,16 @@ class OffboardControl(Node):
         # 侦察任务不需要用户指定顺序，直接按视觉模块返回的顺序（通常是按x轴排序）
         for target_data in named_targets_frd:
             x_frd, y_frd = target_data['coords_frd']
-            ned_x, ned_y = self.coordinate_current_FRD2NED(x_frd, y_frd)
+            if sample_pose is not None:
+                ned_x, ned_y = self.coordinate_current_FRD2NED(
+                    x_frd,
+                    y_frd,
+                    origin_x=sample_pose['x'],
+                    origin_y=sample_pose['y'],
+                    yaw=sample_pose['yaw'],
+                )
+            else:
+                ned_x, ned_y = self.coordinate_current_FRD2NED(x_frd, y_frd)
             
             self.recon_targets_ned.append({
                 'name': target_data['name'],
@@ -2378,7 +2419,7 @@ class OffboardControl(Node):
             self.offboard_setpoint_counter += 1
             return
 
-        if not self.is_vision_ready:
+        if not self._vision_ready_event.is_set():
             self.get_logger().info(
                 "正在等待视觉模型初始化完成，暂不发送 Offboard 心跳或模式切换。",
                 throttle_duration_sec=2,
@@ -2454,6 +2495,7 @@ class OffboardControl(Node):
                 if is_done:
                     self.get_logger().info("第二次投水流程确认完成。")
                     self.Is_Finish_2nd_Drop = True
+                    self.is_FinishDrop = True
             
             
             if not self.is_ReadyToTakeoff:
@@ -2500,6 +2542,8 @@ class OffboardControl(Node):
                     self.get_logger().info("执行步骤3, 计算投水区位置并开始导航...")
                     self.calculate_drop_area_once(self.forward_x)
                     self.is_drop_area_calculated = True
+                    if self.enable_smooth_transit:
+                        self._start_smooth_move((self.DropArea_x, self.DropArea_y, self.takeoff_target_height))
 
                 # 步骤2: 持续导航并检查是否到达
                 self.navigate_to_drop_area()
@@ -2507,12 +2551,13 @@ class OffboardControl(Node):
 
             if self.is_AtDropArea and not self.is_FinishDrop:
                 if self.mission_state == MissionState.START:
-                    self.mission_state = MissionState.GLOBAL_SEARCH
                     with self._map_data_lock:
+                        self.mission_state = MissionState.GLOBAL_SEARCH
                         self.map_data_collection.clear()
                         self.world_target_coordinates_ned.clear()
                         self.mission_targets_ned.clear()
                         self.widecam_map_reset_state = None
+                        self.global_map_accepting_samples = True
                     self.get_logger().info(f"切换为GLOBAL_SEARCH模式。")
                     return
                 
@@ -2525,15 +2570,18 @@ class OffboardControl(Node):
                 if elapsed_drop_time > self.drop_phase_timeout:
                     # self.get_logger().warn(f"投放阶段整体超时（超过 {self.drop_phase_timeout} 秒），进入强制投放流程。")
                     # <<< 修改：不再直接投放，而是切换到专用状态 >>>
-                    self.mission_state = MissionState.TIMEOUT_DROP
+                    with self._map_data_lock:
+                        self.global_map_accepting_samples = False
+                        self.mission_state = MissionState.TIMEOUT_DROP
                 #======启动投放区域计时模块========
                 
                 ## 进入全局搜索模块
                 if self.mission_state == MissionState.GLOBAL_SEARCH:
                     
                     # 开启usb摄像头识别
-                    with self._vision_result_lock:
-                        self.current_vision_info = list(self.latest_vision_info)
+                    self.current_vision_info, _, _ = self._copy_latest_vision_result(
+                        MissionState.GLOBAL_SEARCH
+                    )
                    
                     
                     #启动全局搜索计时器
@@ -2550,6 +2598,7 @@ class OffboardControl(Node):
                     if elapsed_search_time > self.search_timeout:
                         self.get_logger().info("搜索时间到，开始根据多帧平均结果和用户优先级构建最终任务地图。")
                         with self._map_data_lock:
+                            self.global_map_accepting_samples = False
                             self._calculate_and_store_average_map()
                         
                         if not self.mission_targets_ned:
@@ -2690,6 +2739,19 @@ class OffboardControl(Node):
             if self.is_FinishDrop:
                 if self.mission_state.value < MissionState.TRANSIT_TO_RECON_OFFBOARD.value:
                     self.get_logger().info("所有载荷投放完毕，准备在Offboard模式下飞往侦察区域...")
+                    if self.timeout_2nd_postdrop is None:
+                        self.timeout_2nd_postdrop = self.get_clock().now()
+                    elapsed_delay = (
+                        self.get_clock().now() - self.timeout_2nd_postdrop
+                    ).nanoseconds / 1e9
+                    if elapsed_delay <= self.post_drop_delay:
+                        self.publish_position_setpoint(
+                            self.vehicle_local_position.x,
+                            self.vehicle_local_position.y,
+                            self.takeoff_target_height,
+                        )
+                        return
+                    self.is_waiting_post_drop = False
 
                     #回到投放区中心
                     self.publish_position_setpoint(self.DropArea_x,self.DropArea_y,self.takeoff_target_height)
@@ -2714,15 +2776,23 @@ class OffboardControl(Node):
                         target_recon_x_frd,
                         target_recon_y_frd
                     )
+                    if self.enable_smooth_transit and not self.smooth_transit_to_recon_started:
+                        self._start_smooth_move((target_recon_x_ned, target_recon_y_ned, self.takeoff_target_height))
+                        self.smooth_transit_to_recon_started = True
                     
                     self.get_logger().info(f"将从当前位置向前飞 {self.recon_forward_distance}m, "
                                        f"目标侦察区 (NED): ({target_recon_x_ned:.2f}, {target_recon_y_ned:.2f})")
                     
-                    self.publish_position_setpoint(target_recon_x_ned, target_recon_y_ned, self.takeoff_target_height)
+                    if self.enable_smooth_transit and self.is_smoothing_descent:
+                        self._publish_smooth_move_setpoint()
+                    else:
+                        self.publish_position_setpoint(target_recon_x_ned, target_recon_y_ned, self.takeoff_target_height)
 
                     error = math.sqrt((self.vehicle_local_position.x-target_recon_x_ned)**2+(self.vehicle_local_position.y-target_recon_y_ned)**2)
                     if error < 0.5 :
                     # 3. 切换到新的状态
+                        if self.enable_smooth_transit:
+                            self.is_smoothing_descent = False
                         self.mission_state = MissionState.TRANSIT_TO_RECON_OFFBOARD
                     else:
                         return
@@ -2741,11 +2811,15 @@ class OffboardControl(Node):
                         self.recon_search_start_time = self.get_clock().now()
                     self.publish_position_setpoint(self.vehicle_local_position.x, self.vehicle_local_position.y, self.initial_z + self.recon_search_height)
                     elapsed_search_time = (self.get_clock().now() - self.recon_search_start_time).nanoseconds / 1e9
-                    with self._vision_result_lock:
-                        self.current_vision_info = list(self.latest_vision_info)
+                    self.current_vision_info, recon_frame_pose, _ = self._copy_latest_vision_result(
+                        MissionState.RECON_SEARCH
+                    )
                     if elapsed_search_time > self.recon_search_timeout:
                         self.get_logger().info("侦察搜索时间到，构建侦察地图...")
-                        self._build_recon_mission_map(self.current_vision_info)
+                        self._build_recon_mission_map(
+                            self.current_vision_info,
+                            sample_pose=recon_frame_pose,
+                        )
                         if not self.recon_targets_ned:
                             self.get_logger().error("未发现任何侦察目标！任务结束。")
                             self.mission_state = MissionState.MISSION_COMPLETE
@@ -2878,6 +2952,19 @@ class OffboardControl(Node):
         if self.offboard_setpoint_counter % 150 == 0:
             self.get_logger().info(f"控制循环花费时间：{elasped_timer_time:.5f}s")
 
+    def _copy_latest_vision_result(self, expected_state):
+        """Return one internally consistent result captured in the requested state."""
+        with self._vision_result_lock:
+            if self.latest_vision_mission_state != expected_state:
+                return [], None, -1
+            vision_info = [dict(target) for target in self.latest_vision_info]
+            frame_pose = (
+                dict(self.latest_vision_frame_pose)
+                if self.latest_vision_frame_pose is not None else None
+            )
+            frame_sequence = self.latest_vision_frame_sequence
+        return vision_info, frame_pose, frame_sequence
+
     def display_latest_annotated_frame(self):
         """Pump OpenCV GUI events from the process main thread only."""
         if not self.show_video:
@@ -2899,9 +2986,10 @@ class OffboardControl(Node):
         这个回调以较低频率运行，专门处理耗时的视觉任务。
         """
         timer_start = self.get_clock().now()
-        if not self.is_vision_ready:
+        if not self._vision_ready_event.is_set():
             if self.vision_controller.load_model():
                 self.is_vision_ready = True
+                self._vision_ready_event.set()
                 self.get_logger().info("视觉系统准备就绪，开始执行任务逻辑。")
             else:
                 self.get_logger().error(
@@ -2925,15 +3013,16 @@ class OffboardControl(Node):
         if frame_pose is None:
             return
         
-        # <<< 核心决策逻辑 >>>
+        # 推理结束时任务状态可能已改变，结果必须保留开始推理时的状态。
+        mission_state_at_start = self.mission_state
         num_targets_for_vision = 0 # 默认不处理
         
         # 状态1：投水前的全局搜索，需要找 3 个目标
-        if self.mission_state == MissionState.GLOBAL_SEARCH:
+        if mission_state_at_start == MissionState.GLOBAL_SEARCH:
             num_targets_for_vision = 3
         
         # 状态2：侦察阶段的搜索，需要找 5 个目标
-        elif self.mission_state == MissionState.RECON_SEARCH:
+        elif mission_state_at_start == MissionState.RECON_SEARCH:
             num_targets_for_vision = 5
 
         # 核心视觉处理调用
@@ -2947,16 +3036,11 @@ class OffboardControl(Node):
             pitch=frame_pose['pitch'],
         )
 
-        # 只有在进行有效处理时才更新视觉信息
-        if num_targets_for_vision > 0:
-            with self._vision_result_lock:
-                self.latest_vision_info = vision_info
-            if self.mission_state == MissionState.GLOBAL_SEARCH:
-                with self._map_data_lock:
-                    self._collect_global_search_map_sample(vision_info, frame_pose)
+        if self.mission_state != mission_state_at_start:
+            return
         
         # 更新用于显示的 annotated_frame (无论是否处理都更新，以便显示状态)
-        cv2.putText(annotated_frame, f"State: {self.mission_state.name}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(annotated_frame, f"State: {mission_state_at_start.name}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         cv2.putText(annotated_frame, f"Vision Targets: {num_targets_for_vision}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2) # 添加一个状态显示
         if self.latest_drop_evaluation is not None:
             drop_status = self.latest_drop_evaluation['status']
@@ -2972,8 +3056,24 @@ class OffboardControl(Node):
                 drop_color,
                 2,
             )
-        with self._vision_result_lock:
-            self.latest_annotated_frame = annotated_frame
+        if num_targets_for_vision > 0:
+            vision_info_snapshot = [dict(target) for target in vision_info]
+            with self._vision_result_lock:
+                self.latest_vision_info = vision_info_snapshot
+                self.latest_vision_frame_pose = dict(frame_pose)
+                self.latest_vision_frame_sequence = frame_sequence
+                self.latest_vision_mission_state = mission_state_at_start
+                self.latest_annotated_frame = annotated_frame
+            if mission_state_at_start == MissionState.GLOBAL_SEARCH:
+                with self._map_data_lock:
+                    if (
+                        self.global_map_accepting_samples
+                        and self.mission_state == MissionState.GLOBAL_SEARCH
+                    ):
+                        self._collect_global_search_map_sample(vision_info_snapshot, frame_pose)
+        else:
+            with self._vision_result_lock:
+                self.latest_annotated_frame = annotated_frame
 
         elasped_timer_time = (self.get_clock().now() - timer_start).nanoseconds / 1e9
         if self.offboard_setpoint_counter % 150 == 0:
@@ -3069,6 +3169,8 @@ def main(args=None) -> None:
     
     parser.add_argument('--forward-x', type=float, default=3,
                         help='Forward distance to fly to the drop area in meters.')
+    parser.add_argument('--enable-smooth-transit', choices=('true', 'false'), default='false',
+                        help='Use smooth setpoints for transit to drop and recon areas (default: false).')
     parser.add_argument('--search-height', type=float, default=-5.5,
                         help='Global search height in meters (negative value for altitude).')
    
@@ -3077,7 +3179,10 @@ def main(args=None) -> None:
     parser.add_argument('--target-timeout-duration', type=float, default=1.2,
                         help='最新目标观测保持 fresh 的时长（秒）。')
     parser.add_argument('--target-confidence-window', type=float, default=4.0,
-                        help='选择最高置信度目标观测的滚动时间窗（秒）。')
+                        help='目标锚点候选观测的滚动时间窗（秒）。')
+    parser.add_argument('--target-anchor-mode', choices=('max-confidence', 'top25'),
+                        default='max-confidence',
+                        help='目标锚点策略：单个最高置信度观测，或最高25%%观测的坐标中位数。')
     parser.add_argument('--target-anchor-hold-duration', type=float, default=2.5,
                         help='丢失新观测后仍朝固定世界目标移动的最长时间（秒）。')
     parser.add_argument('--target-pose-max-skew', type=float, default=0.20,
@@ -3374,6 +3479,7 @@ def main(args=None) -> None:
     print("------------------ 对准阈值 ------------------")
     print(f"  - 首次对准稳定阈值: {custom_args.first_align_threshold} 米, 稳定时长: {custom_args.first_align_time_window} 秒")
     print(f"  - 第二次对准稳定阈值: {custom_args.second_align_threshold} 米, 稳定时长: {custom_args.second_align_time_window} 秒")
+    print(f"  - 目标锚点策略: {custom_args.target_anchor_mode}, 时间窗口: {custom_args.target_confidence_window} 秒")
     print("------------------ 模式设置 ------------------")
     print(f"  - 视频录制: {'已启用' if custom_args.record_video else '已禁用'}")
     print(f"  - 无头模式 (不显示GUI): {'是' if custom_args.headless else '否'}")

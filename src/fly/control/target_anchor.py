@@ -2,6 +2,7 @@
 
 from collections import deque
 import math
+from statistics import median
 
 
 class TargetAnchorTracker:
@@ -13,8 +14,8 @@ class TargetAnchorTracker:
     * Initial lock: first observation whose confidence is at least
       ``initial_lock_confidence`` (default 0.8).
     * Same-bucket observations (within ``max_anchor_jump_m``) enter a
-      rolling confidence window; the highest-confidence candidate in the
-      window becomes the anchor.
+      rolling confidence window. ``max-confidence`` selects its best sample;
+      ``top25`` uses the coordinate-wise median of its highest quartile.
     * Far observations (beyond ``max_anchor_jump_m``) are rejected
       unconditionally, UNLESS their confidence exceeds the current anchor's
       confidence by more than ``significant_confidence_margin``.  That
@@ -30,6 +31,7 @@ class TargetAnchorTracker:
         max_anchor_jump_m=0.6,
         initial_lock_confidence=0.8,
         significant_confidence_margin=0.3,
+        selection_mode="max-confidence",
     ):
         confidence_window_s = float(confidence_window_s)
         hold_duration_s = float(hold_duration_s)
@@ -59,12 +61,17 @@ class TargetAnchorTracker:
             raise ValueError(
                 "significant_confidence_margin must be non-negative"
             )
+        if selection_mode not in ("max-confidence", "top25"):
+            raise ValueError(
+                "selection_mode must be 'max-confidence' or 'top25'"
+            )
 
         self.confidence_window_s = confidence_window_s
         self.hold_duration_s = hold_duration_s
         self.max_anchor_jump_m = max_anchor_jump_m
         self.initial_lock_confidence = initial_lock_confidence
         self.significant_confidence_margin = significant_confidence_margin
+        self.selection_mode = selection_mode
 
         self._candidates = deque()
         self.anchor_ned = None
@@ -90,14 +97,33 @@ class TargetAnchorTracker:
             self._candidates.popleft()
 
     def _select_best_candidate(self):
-        """Pick the highest-confidence candidate in the window."""
+        """Select an anchor from the candidates that passed the jump gate."""
         if not self._candidates:
             return False
 
-        observed_at_s, confidence, target_ned = max(
-            self._candidates,
-            key=lambda candidate: (candidate[1], candidate[0]),
-        )
+        if self.selection_mode == "max-confidence":
+            observed_at_s, confidence, target_ned = max(
+                self._candidates,
+                key=lambda candidate: (candidate[1], candidate[0]),
+            )
+        else:
+            ranked_candidates = sorted(
+                self._candidates,
+                key=lambda candidate: (candidate[1], candidate[0]),
+                reverse=True,
+            )
+            selected_count = max(1, math.ceil(len(ranked_candidates) * 0.25))
+            selected_candidates = ranked_candidates[:selected_count]
+            observed_at_s = max(
+                candidate[0] for candidate in selected_candidates
+            )
+            confidence = median(
+                candidate[1] for candidate in selected_candidates
+            )
+            target_ned = tuple(
+                median(candidate[2][axis] for candidate in selected_candidates)
+                for axis in range(3)
+            )
         old_anchor = self.anchor_ned
         self.anchor_ned = target_ned
         self.anchor_confidence = confidence
@@ -191,3 +217,46 @@ class TargetAnchorTracker:
         self.anchor_confidence = None
         self.anchor_observed_at_s = None
         self.last_observation_at_s = None
+
+
+def px4_pose_attitude_timestamps_match(
+    position_timestamp_us,
+    attitude_timestamp_us,
+    max_skew_s,
+):
+    """Return whether two positive PX4 sample timestamps are synchronized."""
+    try:
+        position_timestamp_us = float(position_timestamp_us)
+        attitude_timestamp_us = float(attitude_timestamp_us)
+        max_skew_s = float(max_skew_s)
+    except (TypeError, ValueError):
+        return False
+
+    values = (position_timestamp_us, attitude_timestamp_us, max_skew_s)
+    if not all(math.isfinite(value) for value in values):
+        return False
+    if position_timestamp_us <= 0.0 or attitude_timestamp_us <= 0.0:
+        return False
+    if max_skew_s <= 0.0:
+        return False
+    return (
+        abs(position_timestamp_us - attitude_timestamp_us)
+        <= max_skew_s * 1e6
+    )
+
+
+def altitude_within_threshold(current_z, target_z, threshold):
+    """Return whether a finite NED altitude is within a positive threshold."""
+    try:
+        current_z = float(current_z)
+        target_z = float(target_z)
+        threshold = float(threshold)
+    except (TypeError, ValueError):
+        return False
+
+    if not all(
+        math.isfinite(value)
+        for value in (current_z, target_z, threshold)
+    ):
+        return False
+    return threshold > 0.0 and abs(current_z - target_z) < threshold
