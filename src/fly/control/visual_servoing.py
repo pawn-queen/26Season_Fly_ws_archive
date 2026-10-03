@@ -123,6 +123,34 @@ class VisualServoingController:
             print(f"视觉控制器：加载模型失败！错误: {e}")
             return False
 
+    def reset_tracking_state(self):
+        """清空历史和已创建的跟踪器，仅由互斥的视觉回调组调用。
+
+        保留已加载的模型、历史容量、帧计数以及拍照和录像资源。
+        跟踪器重置失败时向调用方抛出异常，以便保留请求并重试。
+        """
+        self.tracking_history.clear()
+
+        model = getattr(self, 'model', None)
+        predictor = getattr(model, 'predictor', None)
+        trackers = getattr(predictor, 'trackers', None)
+        if trackers is None:
+            return
+
+        # 先校验整个快照，避免缺少 reset() 的跟踪器导致前面的跟踪器
+        # 已经执行。reset() 本身若中途失败，由调用方重新执行整个请求。
+        reset_methods = []
+        for index, tracker in enumerate(list(trackers)):
+            reset = getattr(tracker, 'reset', None)
+            if not callable(reset):
+                raise RuntimeError(
+                    f"Tracker at index {index} does not provide a callable reset()"
+                )
+            reset_methods.append(reset)
+
+        for reset in reset_methods:
+            reset()
+
     def reset_for_new_mission(self):
         """重置整个视觉任务，回到最初的全局搜索状态。"""
         print("视觉控制器：任务重置，返回全局搜索。")

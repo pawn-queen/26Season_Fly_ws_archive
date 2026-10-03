@@ -255,6 +255,7 @@ class OffboardControl(Node):
         self.latest_frame_pose_snapshot = None
         self.latest_frame_received_time_ns = None
         self.latest_frame_monotonic_ns = None
+        self.latest_frame_read_started_monotonic_ns = None
         self.latest_frame_sequence = 0
         self.last_processed_frame_sequence = -1
 
@@ -481,6 +482,9 @@ class OffboardControl(Node):
         self.latest_vision_frame_pose = None
         self.latest_vision_frame_sequence = -1
         self.latest_vision_mission_state = None
+        self.vision_epoch = 0
+        self.vision_reset_applied_epoch = 0
+        self.recon_started_monotonic_ns = None
         # 起飞高度判断阈值
         self.takeoff_threshold = args.takeoff_threshold
         # 向前飞行到达点阈值
@@ -1032,6 +1036,7 @@ class OffboardControl(Node):
 
     def camera_timer_callback(self):
         """Capture one USB frame without blocking mission or heartbeat callbacks."""
+        frame_read_started_monotonic_ns = time.monotonic_ns()
         try:
             ret, frame = self.cap.read()
         except cv2.error as exc:
@@ -1051,6 +1056,7 @@ class OffboardControl(Node):
             frame_pose = dict(frame_pose)
             frame_pose['frame_received_ros_time_ns'] = frame_received_ros_time_ns
             frame_pose['frame_received_monotonic_ns'] = frame_received_monotonic_ns
+            frame_pose['frame_read_started_monotonic_ns'] = frame_read_started_monotonic_ns
 
         # 图像、采集时间、拍摄位姿和序号必须原子更新。
         with self._frame_lock:
@@ -1058,6 +1064,7 @@ class OffboardControl(Node):
             self.latest_frame_pose_snapshot = frame_pose
             self.latest_frame_received_time_ns = frame_received_ros_time_ns
             self.latest_frame_monotonic_ns = frame_received_monotonic_ns
+            self.latest_frame_read_started_monotonic_ns = frame_read_started_monotonic_ns
             self.latest_frame_sequence += 1
 
 
@@ -2526,7 +2533,7 @@ class OffboardControl(Node):
                             error_2_center_DropArea = math.sqrt((self.vehicle_local_position.x-self.DropArea_x)**2+(self.vehicle_local_position.y-self.DropArea_y)**2+(self.vehicle_local_position.z-self.takeoff_target_height)**2)
                             if error_2_center_DropArea < 0.5 :
                                 self.get_logger().info("已回到投放区中心")
-                                self.mission_state = MissionState.RETURN_TO_CENTER_DROPAREA
+                                self._enter_recon_transit()
                             else:
                                 return
                         else:
@@ -2576,7 +2583,7 @@ class OffboardControl(Node):
                 # 状态：RECON_AREA_SWITCH_TO_OFFBOARD
                 elif self.mission_state == MissionState.TRANSIT_TO_RECON_OFFBOARD:
                     self.get_logger().info("已成功切换回Offboard模式，开始侦察搜索。")
-                    self.mission_state = MissionState.RECON_SEARCH
+                    self._start_recon_search()
 
                 # 状态：RECON_SEARCH
                 elif self.mission_state == MissionState.RECON_SEARCH:
@@ -2730,6 +2737,55 @@ class OffboardControl(Node):
         if self.offboard_setpoint_counter % 150 == 0:
             self.get_logger().info(f"控制循环花费时间：{elasped_timer_time:.5f}s")
 
+    def _enter_recon_transit(self):
+        """Request one new tracking session without waiting for vision inference."""
+        with self._vision_result_lock:
+            if self.mission_state == MissionState.RETURN_TO_CENTER_DROPAREA:
+                return
+            self.vision_epoch += 1
+            self.latest_vision_info = []
+            self.latest_vision_frame_pose = None
+            self.latest_vision_frame_sequence = -1
+            self.latest_vision_mission_state = None
+            self.latest_annotated_frame = None
+            self.current_vision_info = []
+            self.recon_started_monotonic_ns = None
+            self.mission_state = MissionState.RETURN_TO_CENTER_DROPAREA
+        self.get_logger().info("进入侦察转场：已请求清空广角历史帧并重置跟踪器。")
+
+    def _start_recon_search(self):
+        """Only accept camera reads started after entering the recon search."""
+        with self._vision_result_lock:
+            if self.mission_state == MissionState.RECON_SEARCH:
+                return
+            self.recon_started_monotonic_ns = time.monotonic_ns()
+            self.mission_state = MissionState.RECON_SEARCH
+
+    def _apply_pending_vision_reset(self):
+        """Run tracking resets exclusively from the vision callback group."""
+        with self._vision_result_lock:
+            requested_epoch = self.vision_epoch
+            if self.vision_reset_applied_epoch == requested_epoch:
+                return True
+
+        # Never hold the result lock while touching YOLO: control and heartbeat
+        # callbacks must remain free to run, even during a slow or failed reset.
+        try:
+            self.vision_controller.reset_tracking_state()
+        except Exception as exc:
+            self.get_logger().error(
+                f"侦察视觉状态重置失败，保留请求并等待重试：{exc}",
+                throttle_duration_sec=2,
+            )
+            return False
+
+        with self._vision_result_lock:
+            self.vision_reset_applied_epoch = requested_epoch
+            reset_is_current = self.vision_epoch == requested_epoch
+        if reset_is_current:
+            self.get_logger().info("广角历史帧和YOLO跟踪器已重置，等待新的侦察图像。")
+        return reset_is_current
+
     def _copy_latest_vision_result(self, expected_state):
         """Return one internally consistent vision result for the requested state."""
         with self._vision_result_lock:
@@ -2763,6 +2819,9 @@ class OffboardControl(Node):
     def vision_timer_callback(self):
         """Load the model and process only the newest unprocessed USB frame."""
         timer_start = self.get_clock().now()
+        # Reset requests must not depend on a new image or a valid vehicle pose.
+        if not self._apply_pending_vision_reset():
+            return
         if not self._vision_ready_event.is_set():
             if self.vision_controller.load_model():
                 self.is_vision_ready = True
@@ -2788,31 +2847,45 @@ class OffboardControl(Node):
                 dict(self.latest_frame_pose_snapshot)
                 if self.latest_frame_pose_snapshot is not None else None
             )
+            frame_read_started_monotonic_ns = self.latest_frame_read_started_monotonic_ns
             self.last_processed_frame_sequence = frame_sequence
 
         if frame_pose is None:
             return
 
-        # 推理可能比状态机慢，因此记录开始推理时的状态；状态已变化时丢弃结果。
-        mission_state_at_start = self.mission_state
+        # A reset and a state transition must be observed as one session snapshot.
+        with self._vision_result_lock:
+            mission_state_at_start = self.mission_state
+            vision_epoch_at_start = self.vision_epoch
+            recon_started_monotonic_ns = self.recon_started_monotonic_ns
+            if self.vision_reset_applied_epoch != vision_epoch_at_start:
+                return
         num_targets_for_vision = 0
         if mission_state_at_start == MissionState.GLOBAL_SEARCH:
             num_targets_for_vision = 3
         elif mission_state_at_start == MissionState.RECON_SEARCH:
+            if (
+                recon_started_monotonic_ns is None
+                or frame_read_started_monotonic_ns is None
+                or frame_read_started_monotonic_ns < recon_started_monotonic_ns
+            ):
+                return
             num_targets_for_vision = 5
 
         initial_z = self.initial_z if self.initial_z is not None else 0.0
         current_altitude = frame_pose['z'] - initial_z
-        vision_info, annotated_frame = self.vision_controller.process_frame(
-            frame_to_process,
-            current_altitude,
-            max_targets_to_confirm=num_targets_for_vision,
-            roll=frame_pose['roll'],
-            pitch=frame_pose['pitch'],
-        )
-
-        if self.mission_state != mission_state_at_start:
-            return
+        try:
+            vision_info, annotated_frame = self.vision_controller.process_frame(
+                frame_to_process,
+                current_altitude,
+                max_targets_to_confirm=num_targets_for_vision,
+                roll=frame_pose['roll'],
+                pitch=frame_pose['pitch'],
+            )
+        finally:
+            # An old in-flight inference may append history after state 10 was
+            # entered. Clear it here before another session can process a frame.
+            self._apply_pending_vision_reset()
 
         cv2.putText(
             annotated_frame,
@@ -2833,28 +2906,33 @@ class OffboardControl(Node):
             2,
         )
 
-        if num_targets_for_vision > 0:
-            vision_info_snapshot = [dict(target) for target in vision_info]
-            with self._vision_result_lock:
+        vision_info_snapshot = [dict(target) for target in vision_info]
+        with self._vision_result_lock:
+            # Check and publish under the same lock as the reset request. An
+            # old result must never repopulate the cleared recon session.
+            if (
+                self.mission_state != mission_state_at_start
+                or self.vision_epoch != vision_epoch_at_start
+                or self.vision_reset_applied_epoch != vision_epoch_at_start
+            ):
+                return
+            if num_targets_for_vision > 0:
                 self.latest_vision_info = vision_info_snapshot
                 self.latest_vision_frame_pose = dict(frame_pose)
                 self.latest_vision_frame_sequence = frame_sequence
                 self.latest_vision_mission_state = mission_state_at_start
-                self.latest_annotated_frame = annotated_frame
+            self.latest_annotated_frame = annotated_frame
 
-            if mission_state_at_start == MissionState.GLOBAL_SEARCH:
-                with self._map_data_lock:
-                    if (
-                        self.global_map_accepting_samples
-                        and self.mission_state == MissionState.GLOBAL_SEARCH
-                    ):
-                        self._collect_global_search_map_sample(
-                            vision_info_snapshot,
-                            frame_pose,
-                        )
-        else:
-            with self._vision_result_lock:
-                self.latest_annotated_frame = annotated_frame
+        if mission_state_at_start == MissionState.GLOBAL_SEARCH:
+            with self._map_data_lock:
+                if (
+                    self.global_map_accepting_samples
+                    and self.mission_state == MissionState.GLOBAL_SEARCH
+                ):
+                    self._collect_global_search_map_sample(
+                        vision_info_snapshot,
+                        frame_pose,
+                    )
 
         elasped_timer_time = (
             self.get_clock().now() - timer_start
