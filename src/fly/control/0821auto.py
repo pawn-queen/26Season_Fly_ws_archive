@@ -2426,10 +2426,19 @@ class OffboardControl(Node):
                         return
                     # ================================================================
 
-                    # 检查是否所有规划的目标都已打击，或已用完两次投放机会
-                    if self.current_target_index >= len(self.mission_targets_ned) or self.visited_targets_count >= 2:
-                        self.get_logger().info("所有已规划的目标均已打击，或已完成两次投放。任务完成。")
-                        self.is_FinishDrop = True # 触发外部状态机进入 DROP_COMPLETE
+                    # 目标已经耗尽 / 已访问两次，但仍有载荷未投放时，先进入强制投放流程
+                    if (
+                        self.current_target_index >= len(self.mission_targets_ned)
+                        or self.visited_targets_count >= 2
+                    ):
+                        if self.Is_Finish_1st_Drop and self.Is_Finish_2nd_Drop:
+                            self.get_logger().info("所有载荷均已投放，投放任务完成。")
+                            self.is_FinishDrop = True
+                        else:
+                            self.get_logger().warn(
+                                "已无剩余可打击目标，但仍有未投放载荷，进入强制投放流程。"
+                            )
+                            self.mission_state = MissionState.TIMEOUT_DROP
                         return
 
                     # 获取当前要打击的目标
