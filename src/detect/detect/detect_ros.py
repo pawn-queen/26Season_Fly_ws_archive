@@ -35,7 +35,7 @@ class YOLOv5ROS2(Node):
         self.declare_parameter('camera_info_topic', '/camera/camera/color/camera_info')
 
         self.declare_parameter('show_image', False) 
-        self.declare_parameter('publish_debug_image', False)
+        self.declare_parameter('publish_debug_image', True)
         # <<< 修改：参数名从 record_depth_video 改为 record_rgb_video，更清晰
         self.declare_parameter('record_rgb_video', False)
         self.declare_parameter('video_output_path', '/home/depth_videos')
@@ -349,18 +349,25 @@ class YOLOv5ROS2(Node):
         # --- (可选) 调试图像；使用原始 RGB 时间戳与 viewer 缓存帧匹配 ---
         if self.show_image or self.publish_debug_image:
             try:
-                selected_index = None if selected is None else selected['target_index']
-                annotated_image = self.draw_detections(
-                    color_image.copy(), results, selected_index
+                should_publish_debug = (
+                    self.publish_debug_image
+                    and self.debug_image_publisher is not None
+                    and color_header is not None
+                    and self.debug_image_publisher.get_subscription_count() > 0
                 )
-                if self.publish_debug_image and color_header is not None:
-                    debug_msg = self.bridge.cv2_to_imgmsg(
-                        annotated_image, encoding='bgr8'
+                if self.show_image or should_publish_debug:
+                    selected_index = None if selected is None else selected['target_index']
+                    annotated_image = self.draw_detections(
+                        color_image.copy(), results, selected_index
                     )
-                    debug_msg.header = color_header
-                    self.debug_image_publisher.publish(debug_msg)
-                if self.show_image:
-                    self.show_detections(annotated_image)
+                    if should_publish_debug:
+                        debug_msg = self.bridge.cv2_to_imgmsg(
+                            annotated_image, encoding='bgr8'
+                        )
+                        debug_msg.header = color_header
+                        self.debug_image_publisher.publish(debug_msg)
+                    if self.show_image:
+                        self.show_detections(annotated_image)
             except Exception as exc:
                 self.get_logger().warn(
                     f"Failed to render debug image: {exc}",
