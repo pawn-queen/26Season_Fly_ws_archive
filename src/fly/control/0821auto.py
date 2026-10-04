@@ -254,6 +254,8 @@ class OffboardControl(Node):
         if not self.cap.isOpened():
             self.get_logger().error("无法打开摄像头！")
             rclpy.shutdown()
+        else:
+            self._configure_widecam_capture(args.camera_timer_period)
 
         self.latest_frame = None  # 用于存储最新接收到的图像帧
         # A map sample must use the vehicle pose captured with its image frame.
@@ -468,13 +470,13 @@ class OffboardControl(Node):
             callback_group=self.heartbeat_callback_group,
         )
         self.camera_timer = self.create_timer(
-            self.dt,
+            args.timer_period if args.camera_timer_period is None else args.camera_timer_period,
             self.camera_timer_callback,
             callback_group=self.image_callback_group,
         )
 
-        # 创建一个新的、较慢的视觉处理定时器
-        self.vision_processing_period = args.vision_timer_period # 10Hz, 可根据设备性能调整
+        # 视觉处理周期独立于控制、心跳和相机采集周期。
+        self.vision_processing_period = args.vision_timer_period
         self.vision_timer = self.create_timer(
             self.vision_processing_period,
             self.vision_timer_callback,
@@ -495,7 +497,7 @@ class OffboardControl(Node):
         self._widecam_last_debug_key = None
         self._widecam_last_debug_phase = None
         self.widecam_debug_timer = self.create_timer(
-            0.1,
+            1.0 / 30.0,
             self.widecam_debug_timer_callback,
             callback_group=self.widecam_debug_callback_group,
         )
@@ -1047,6 +1049,30 @@ class OffboardControl(Node):
                 match = re.search(r"(/dev/video\d+)", line)
                 if match: return match.group(1)
         return None
+
+    def _configure_widecam_capture(self, camera_timer_period):
+        """Request an explicit capture rate without changing camera geometry."""
+        if camera_timer_period is not None:
+            requested_fps = 1.0 / camera_timer_period
+            try:
+                if not self.cap.set(cv2.CAP_PROP_FPS, requested_fps):
+                    self.get_logger().warn(
+                        f"广角相机不支持设置 {requested_fps:.2f} FPS，将沿用设备协商帧率。"
+                    )
+            except cv2.error as exc:
+                self.get_logger().warn(
+                    f"广角相机帧率设置失败，将沿用设备协商帧率：{exc}"
+                )
+        try:
+            reported_fps = self.cap.get(cv2.CAP_PROP_FPS)
+            width = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            height = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            self.get_logger().info(
+                f"广角相机报告：{reported_fps:.2f} FPS，{width:.0f} x {height:.0f}；"
+                "实际采集和处理频率取决于设备与运行负载。"
+            )
+        except cv2.error as exc:
+            self.get_logger().warn(f"无法读取广角相机协商参数：{exc}")
 
     def camera_timer_callback(self):
         """Capture one USB frame without blocking mission or heartbeat callbacks."""
@@ -2845,7 +2871,7 @@ class OffboardControl(Node):
         message.encoding = 'bgr8'
         message.is_bigendian = 0
         message.step = message.width * 3
-        message.data = contiguous_frame.tobytes()
+        message.data.frombytes(memoryview(contiguous_frame).cast('B'))
         return message
 
     def widecam_debug_timer_callback(self):
@@ -2957,7 +2983,7 @@ class OffboardControl(Node):
                 or frame_sequence == self.last_processed_frame_sequence
             ):
                 return
-            frame_to_process = self.latest_frame.copy()
+            frame_snapshot = self.latest_frame
             frame_pose = (
                 dict(self.latest_frame_pose_snapshot)
                 if self.latest_frame_pose_snapshot is not None else None
@@ -2991,6 +3017,9 @@ class OffboardControl(Node):
 
         initial_z = self.initial_z if self.initial_z is not None else 0.0
         current_altitude = frame_pose['z'] - initial_z
+        # Retain a private input because non-search processing returns it for
+        # status overlays. The camera can install a newer frame during this copy.
+        frame_to_process = frame_snapshot.copy()
         try:
             vision_info, annotated_frame = self.vision_controller.process_frame(
                 frame_to_process,
@@ -3222,6 +3251,8 @@ def main(args=None) -> None:
      # --- 定时器参数 ---
     parser.add_argument('--timer-period', type=float, default=0.03,
                         help='定时器周期 (秒), 这也决定了PID控制中的 dt。默认: 0.03s (约33Hz).')
+    parser.add_argument('--camera-timer-period', type=float, default=None,
+                        help='广角采集周期 (秒)，显式设置时同时向设备请求对应帧率；默认沿用控制周期。')
     parser.add_argument('--vision-timer-period', type=float, default=0.1,
                         help='定时器周期 (秒), 默认: 0.1s (10Hz).')
 
@@ -3298,6 +3329,14 @@ def main(args=None) -> None:
     # 使用 rclpy.utilities.remove_ros_args 来确保我们只解析自己的参数，
     # 这样可以安全地与 ROS2 的参数（如 --ros-args）一起使用。
     custom_args = parser.parse_args(args=rclpy.utilities.remove_ros_args(args=sys.argv)[1:])
+
+    for option, period in (
+        ('--timer-period', custom_args.timer_period),
+        ('--camera-timer-period', custom_args.camera_timer_period),
+        ('--vision-timer-period', custom_args.vision_timer_period),
+    ):
+        if period is not None and (not math.isfinite(period) or period <= 0.0):
+            parser.error(f'{option} must be finite and positive')
 
     if not custom_args.headless and not opencv_gui_available():
         print(

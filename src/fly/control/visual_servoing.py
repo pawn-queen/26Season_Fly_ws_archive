@@ -311,7 +311,6 @@ class VisualServoingController:
 
         # 4. 可视化
         annotated_frame = frame.copy()
-        video_frame = frame.copy()  # 用于视频录制的原始帧
         name_map = {tgt['id']: tgt['name'] for tgt in confirmed_targets_info}
 
         for det in current_frame_detections:
@@ -332,7 +331,7 @@ class VisualServoingController:
                 height, width = annotated_frame.shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*'XVID')
                 self.video_writer = cv2.VideoWriter(self.video_full_path, fourcc, self.video_fps, (width, height))
-            self.video_writer.write(video_frame)
+            self.video_writer.write(frame)
 
         if self.enable_photo_capture and self.frame_counter % self.photo_capture_interval == 0:
             timestamp = time.strftime("%H%M%S")
