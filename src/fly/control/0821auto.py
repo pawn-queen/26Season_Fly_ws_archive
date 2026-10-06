@@ -2881,6 +2881,11 @@ class OffboardControl(Node):
             debug_requested = self.widecam_debug_publisher.get_subscription_count() > 0
             if not raw_requested and not debug_requested:
                 return
+            # Leave image packing and transport idle while YOLO loads and
+            # performs its first tracking warmup. The 30 Hz timer stays active
+            # and resumes preview on its next tick after model readiness.
+            if not self._vision_ready_event.is_set():
+                return
 
             now_ns = time.monotonic_ns()
             # Captured/annotated arrays are immutable after their snapshot is
