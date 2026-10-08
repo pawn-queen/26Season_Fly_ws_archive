@@ -418,6 +418,7 @@ class OffboardControl(Node):
             hold_duration_s=args.target_anchor_hold_duration,
             selection_mode=args.target_anchor_mode,
             lock_enabled=args.lock_enabled == 'true',
+            newest_confidence_threshold=args.newest_confidence_threshold,
         )
         self.target_anchor_jump_pending = False
         self.target_anchor_reset_state = None
@@ -655,6 +656,12 @@ class OffboardControl(Node):
             return
         if confidence is not None and not math.isfinite(confidence):
             self.get_logger().warn("忽略置信度无效的目标观测。", throttle_duration_sec=2)
+            return
+        # Reject before stream-gap handling can reset the cached anchor.
+        if self.target_anchor_tracker.selection_mode == 'newest' and (
+            confidence is None
+            or confidence < self.target_anchor_tracker.newest_confidence_threshold
+        ):
             return
 
         now = self.get_clock().now()
@@ -3248,9 +3255,11 @@ def main(args=None) -> None:
     parser.add_argument('--target-confidence-window', type=float, default=4.0,
                         help='目标锚点候选观测的滚动时间窗（秒）。')
     parser.add_argument('--target-anchor-mode',
-                        choices=('max-confidence', 'top25'),
+                        choices=('max-confidence', 'top25', 'newest'),
                         default='max-confidence',
-                        help='目标锚点策略：单个最高置信度观测，或最高25%%观测的坐标中位数。')
+                        help='目标锚点策略：最高置信度、最高25%%坐标中位数，或最新达标观测。')
+    parser.add_argument('--newest-confidence-threshold', type=float, default=0.9,
+                        help='仅newest模式使用的置信度阈值，达到阈值才更新锚点（默认0.9）。')
     parser.add_argument('--lock-enabled', choices=('true', 'false'), default='false',
                         help='启用NED水平1米目标锁；生命周期复用目标置信度窗口（默认关闭）。')
     parser.add_argument('--target-anchor-hold-duration', type=float, default=2.5,
@@ -3425,6 +3434,11 @@ def main(args=None) -> None:
         or custom_args.target_confidence_window <= 0.0
     ):
         parser.error('--target-confidence-window must be positive')
+    if custom_args.target_anchor_mode == 'newest' and (
+        not math.isfinite(custom_args.newest_confidence_threshold)
+        or not 0.0 <= custom_args.newest_confidence_threshold <= 1.0
+    ):
+        parser.error('--newest-confidence-threshold must be in [0, 1]')
     if (
         not math.isfinite(custom_args.target_anchor_hold_duration)
         or custom_args.target_anchor_hold_duration < 0.0
@@ -3525,7 +3539,12 @@ def main(args=None) -> None:
     print("------------------ 对准阈值 ------------------")
     print(f"  - 首次对准稳定阈值: {custom_args.first_align_threshold} 米, 稳定时长: {custom_args.first_align_time_window} 秒")
     print(f"  - 第二次对准稳定阈值: {custom_args.second_align_threshold} 米, 稳定时长: {custom_args.second_align_time_window} 秒")
-    print(f"  - 目标锚点策略: {custom_args.target_anchor_mode}, 时间窗口: {custom_args.target_confidence_window} 秒")
+    if custom_args.target_anchor_mode == 'newest':
+        print(f"  - 目标锚点策略: newest, 置信度阈值: {custom_args.newest_confidence_threshold}, 无候选选择时间窗")
+        if custom_args.lock_enabled == 'true':
+            print(f"  - NED锁时间窗口: {custom_args.target_confidence_window} 秒")
+    else:
+        print(f"  - 目标锚点策略: {custom_args.target_anchor_mode}, 时间窗口: {custom_args.target_confidence_window} 秒")
     print(f"  - NED目标锁定: {'已启用' if custom_args.lock_enabled == 'true' else '已禁用'}")
     print("------------------ 模式设置 ------------------")
     print(f"  - 视频录制: {'已启用' if custom_args.record_video else '已禁用'}")

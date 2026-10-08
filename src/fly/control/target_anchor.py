@@ -24,6 +24,7 @@ class TargetAnchorTracker:
     vector from moving with the aircraft while it is being blown or commanded
     horizontally.  By default the highest-confidence observation wins; the
     optional top25 mode uses the coordinate-wise median of the top quartile.
+    The newest mode selects the latest observation meeting its own threshold.
     """
 
     def __init__(
@@ -32,6 +33,7 @@ class TargetAnchorTracker:
         hold_duration_s=2.5,
         selection_mode="max-confidence",
         lock_enabled=False,
+        newest_confidence_threshold=0.9,
     ):
         """Initialize the selection mode, window, and target-loss hold time."""
         confidence_window_s = float(confidence_window_s)
@@ -43,15 +45,23 @@ class TargetAnchorTracker:
             raise ValueError("confidence_window_s must be positive")
         if not math.isfinite(hold_duration_s) or hold_duration_s < 0.0:
             raise ValueError("hold_duration_s must be non-negative")
-        if selection_mode not in ("max-confidence", "top25"):
+        if selection_mode not in ("max-confidence", "top25", "newest"):
             raise ValueError(
-                "selection_mode must be 'max-confidence' or 'top25'"
+                "selection_mode must be 'max-confidence', 'top25', or 'newest'"
             )
+        if selection_mode == "newest":
+            newest_confidence_threshold = float(newest_confidence_threshold)
+            if (
+                not math.isfinite(newest_confidence_threshold)
+                or not 0.0 <= newest_confidence_threshold <= 1.0
+            ):
+                raise ValueError("newest_confidence_threshold must be in [0, 1]")
 
         self.confidence_window_s = confidence_window_s
         self.hold_duration_s = hold_duration_s
         self.selection_mode = selection_mode
         self.lock_enabled = lock_enabled
+        self.newest_confidence_threshold = newest_confidence_threshold
         self.lock_ned = None
         self._candidates = deque()
         self.anchor_ned = None
@@ -84,6 +94,11 @@ class TargetAnchorTracker:
             observed_at_s, confidence, target_ned = max(
                 self._candidates,
                 key=lambda candidate: (candidate[1], candidate[0]),
+            )
+        elif self.selection_mode == "newest":
+            observed_at_s, confidence, target_ned = max(
+                self._candidates,
+                key=lambda candidate: candidate[0],
             )
         else:
             ranked_candidates = sorted(
@@ -150,7 +165,7 @@ class TargetAnchorTracker:
         target_ned = self._validated_ned(target_ned)
 
         if confidence is None:
-            if self.lock_enabled:
+            if self.lock_enabled or self.selection_mode == "newest":
                 return ObservationResult(False, False)
             self.last_observation_at_s = observed_at_s
             old_anchor = self.anchor_ned
@@ -163,6 +178,11 @@ class TargetAnchorTracker:
         confidence = float(confidence)
         if not math.isfinite(confidence):
             raise ValueError("confidence must be finite or None")
+        if (
+            self.selection_mode == "newest"
+            and confidence < self.newest_confidence_threshold
+        ):
+            return ObservationResult(False, False)
 
         lock_acquired = False
         if self.lock_enabled:
