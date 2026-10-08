@@ -15,6 +15,9 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 import os
+import threading
+import time
+from collections import deque
 from detect.target_selection import (
     TARGET_OBSERVATION_FRAME_ID,
     choose_highest_confidence_candidate,
@@ -41,6 +44,9 @@ class YOLOv5ROS2(Node):
         self.declare_parameter('video_output_path', '/home/depth_videos')
         self.declare_parameter('publish_legacy_target_position', False)
         self.declare_parameter('max_rgb_depth_skew', 0.04)
+        self.declare_parameter('max_processing_hz', 60.0)
+        self.declare_parameter('debug_image_hz', 30.0)
+        self.declare_parameter('recording_fps', 15.0)
 
 
         # --- 获取参数 ---
@@ -68,6 +74,31 @@ class YOLOv5ROS2(Node):
             or self.max_rgb_depth_skew <= 0.0
         ):
             raise ValueError("max_rgb_depth_skew must be positive")
+        self.max_processing_hz = self._positive_rate('max_processing_hz')
+        self.debug_image_hz = self._positive_rate('debug_image_hz')
+        self.recording_fps = self._positive_rate('recording_fps')
+
+        # ROS reception never waits for inference or video encoding.  Each
+        # worker owns at most one pending item; a newer item replaces it.
+        self._stop_event = threading.Event()
+        self._pair_condition = threading.Condition()
+        self._record_condition = threading.Condition()
+        self._pending_pair = None
+        self._pending_record_frame = None
+        self._recent_pair_keys = deque()
+        self._seen_pair_keys = set()
+        self._last_pair_received_time_ns = None
+        self._last_observation_stamp_ns = None
+        self._last_rgb_frame_id = None
+        self._pair_sequence = 0
+        self._record_sequence = 0
+        self._inference_thread = None
+        self._recording_thread = None
+        self._debug_next_at = 0.0
+        self._display_lock = threading.Lock()
+        self._display_frame = None
+        self._display_generation = 0
+        self._displayed_generation = -1
 
         qos_profile_target = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -153,23 +184,149 @@ class YOLOv5ROS2(Node):
 
     def destroy_node(self):
         """在节点销毁时调用的清理函数，确保资源被释放"""
+        self._stop_event.set()
+        with self._pair_condition:
+            self._pending_pair = None
+            self._pair_condition.notify_all()
+        with self._record_condition:
+            self._pending_record_frame = None
+            self._record_condition.notify_all()
+        # The existing service stop timeout still bounds a stuck backend.
+        # Do not destroy publishers or release a writer underneath its owner.
+        for worker in (self._inference_thread, self._recording_thread):
+            if (
+                worker is not None and worker.ident is not None
+                and worker is not threading.current_thread()
+            ):
+                worker.join()
         context_is_valid = rclpy.ok(context=self.context)
         if context_is_valid:
             self.get_logger().info("Node is shutting down, attempting to clean up...")
-        if self.video_writer is not None:
-            if context_is_valid:
-                self.get_logger().info("Releasing video writer...")
-            self.video_writer.release()
-            if context_is_valid:
-                self.get_logger().info("Video writer released.")
-        elif context_is_valid:
-            self.get_logger().warn("Video writer was not initialized, no video to save.")
         if self.show_image:
             try:
                 cv2.destroyAllWindows()
             except cv2.error:
                 pass
         super().destroy_node()
+
+    def _positive_rate(self, name):
+        value = self.get_parameter(name).get_parameter_value().double_value
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError('%s must be positive and finite' % name)
+        return float(value)
+
+    def start_workers(self):
+        """Start one model owner and, if requested, one video writer owner."""
+        if self._inference_thread is not None:
+            return
+        self._inference_thread = threading.Thread(
+            target=self._inference_loop, name='detect-inference', daemon=True,
+        )
+        if self.record_rgb:
+            self._recording_thread = threading.Thread(
+                target=self._recording_loop, name='detect-recording', daemon=True,
+            )
+            self._recording_thread.start()
+        self._inference_thread.start()
+
+    def _inference_loop(self):
+        next_at = 0.0
+        while not self._stop_event.is_set():
+            with self._pair_condition:
+                while not self._stop_event.is_set():
+                    if self._pending_pair is None:
+                        self._pair_condition.wait()
+                        continue
+                    delay = next_at - time.monotonic()
+                    if delay > 0.0:
+                        self._pair_condition.wait(delay)
+                        continue
+                    pair = self._pending_pair
+                    self._pending_pair = None
+                    next_at = time.monotonic() + 1.0 / self.max_processing_hz
+                    break
+                else:
+                    return
+            if self._stop_event.is_set():
+                return
+            color_msg, depth_msg, observation_header, intrinsics, _ = pair
+            try:
+                color_image = self.bridge.imgmsg_to_cv2(
+                    color_msg, desired_encoding='bgr8'
+                )
+                depth_image = self.bridge.imgmsg_to_cv2(
+                    depth_msg, desired_encoding='passthrough'
+                )
+                if not self._stop_event.is_set():
+                    self.process_images(
+                        color_image, depth_image, depth_msg.encoding,
+                        observation_header, color_msg.header,
+                        intrinsics=intrinsics,
+                    )
+            except Exception as exc:
+                if not self._stop_event.is_set():
+                    self.get_logger().error(
+                        f'Failed to process synced images: {exc}',
+                        throttle_duration_sec=2,
+                    )
+
+    def _offer_recording_frame(self, frame):
+        if not self.record_rgb or self._stop_event.is_set():
+            return
+        with self._record_condition:
+            if not self.record_rgb or self._stop_event.is_set():
+                return
+            self._record_sequence += 1
+            # Inputs are read-only; annotations are drawn on a separate copy.
+            self._pending_record_frame = (self._record_sequence, frame)
+            self._record_condition.notify()
+
+    def _recording_loop(self):
+        next_at = 0.0
+        try:
+            while not self._stop_event.is_set():
+                with self._record_condition:
+                    while not self._stop_event.is_set():
+                        if self._pending_record_frame is None:
+                            self._record_condition.wait()
+                            continue
+                        delay = next_at - time.monotonic()
+                        if delay > 0.0:
+                            self._record_condition.wait(delay)
+                            continue
+                        _, frame = self._pending_record_frame
+                        self._pending_record_frame = None
+                        next_at = time.monotonic() + 1.0 / self.recording_fps
+                        break
+                    else:
+                        return
+                if self._stop_event.is_set():
+                    return
+                if self.video_writer is None:
+                    filename = self.get_unique_filename()
+                    height, width = frame.shape[:2]
+                    self.video_writer = cv2.VideoWriter(
+                        filename, cv2.VideoWriter_fourcc(*'XVID'),
+                        self.recording_fps, (width, height), isColor=True,
+                    )
+                    if not self.video_writer.isOpened():
+                        raise RuntimeError('Failed to open video writer: ' + filename)
+                    self.is_recording = True
+                    self.get_logger().info('Started recording RGB video to ' + filename)
+                self.video_writer.write(frame)
+        except Exception as exc:
+            self.record_rgb = False
+            self.get_logger().error(
+                f'RGB recording stopped after an error: {exc}',
+                throttle_duration_sec=2,
+            )
+        finally:
+            if self.video_writer is not None:
+                self.video_writer.release()
+                self.video_writer = None
+            self.is_recording = False
+            with self._record_condition:
+                self._pending_record_frame = None
 
     def camera_info_callback(self, msg):
         """
@@ -188,6 +345,8 @@ class YOLOv5ROS2(Node):
             self.destroy_subscription(self.camera_info_sub)
 
     def synced_callback(self, color_msg, depth_msg):
+        if self._stop_event.is_set():
+            return
         frame_received_at = self.get_clock().now()
         color_stamp_s = (
             float(color_msg.header.stamp.sec)
@@ -212,22 +371,53 @@ class YOLOv5ROS2(Node):
             self.get_logger().warn('Waiting for camera intrinsics, skipping frame...', throttle_duration_sec=2)
             return
         
-        try:
-            # 彩色图使用 bgr8 格式，它与OpenCV原生格式兼容
-            color_image = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
-            depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
-            self.process_images(
-                color_image,
-                depth_image,
-                depth_msg.encoding,
-                self._pose_matching_header(
-                    color_msg.header,
-                    frame_received_at,
-                ),
-                color_msg.header,
+        observation_header = self._pose_matching_header(
+            color_msg.header, frame_received_at,
+        )
+        pair_key = (
+            color_msg.header.frame_id,
+            color_msg.header.stamp.sec, color_msg.header.stamp.nanosec,
+        )
+        observation_stamp_ns = (
+            observation_header.stamp.sec * 1_000_000_000
+            + observation_header.stamp.nanosec
+        )
+        with self._pair_condition:
+            if self._stop_event.is_set():
+                return
+            if (
+                self._last_rgb_frame_id != color_msg.header.frame_id
+                or (self._last_pair_received_time_ns is not None
+                    and frame_received_at.nanoseconds
+                    < self._last_pair_received_time_ns)
+            ):
+                # A new source/ROS clock epoch can establish a new watermark.
+                self._recent_pair_keys.clear()
+                self._seen_pair_keys.clear()
+                self._last_observation_stamp_ns = None
+            self._last_rgb_frame_id = color_msg.header.frame_id
+            self._last_pair_received_time_ns = frame_received_at.nanoseconds
+            if (
+                self._last_observation_stamp_ns is not None
+                and observation_stamp_ns < self._last_observation_stamp_ns
+            ):
+                return
+            # A zero source stamp has no usable frame identity; retain the
+            # reception sequence instead of suppressing all subsequent frames.
+            if color_stamp_s > 0.0:
+                if pair_key in self._seen_pair_keys:
+                    return
+                self._seen_pair_keys.add(pair_key)
+                self._recent_pair_keys.append(pair_key)
+                if len(self._recent_pair_keys) > 128:
+                    self._seen_pair_keys.remove(self._recent_pair_keys.popleft())
+            self._last_observation_stamp_ns = observation_stamp_ns
+            self._pair_sequence += 1
+            self._pending_pair = (
+                color_msg, depth_msg, observation_header,
+                (self.fx, self.fy, self.cx, self.cy), self._pair_sequence,
             )
-        except Exception as e:
-            self.get_logger().error(f"Failed to process synced images: {e}")
+            self._pair_condition.notify()
 
     def _pose_matching_header(self, source_header, frame_received_at):
         """Use the source stamp only when it shares this node's clock domain."""
@@ -267,34 +457,12 @@ class YOLOv5ROS2(Node):
         depth_encoding='',
         observation_header=None,
         color_header=None,
+        intrinsics=None,
     ):
-        # --- (可选) 视频录制 ---
-        # <<< 修改：整个录制逻辑现在针对 color_image
-        if self.record_rgb and not self.is_recording:
-            try:
-                filename = self.get_unique_filename()
-                fps = 15 
-                # 从彩色图像获取高度和宽度
-                h, w, _ = color_image.shape
-                fourcc = cv2.VideoWriter_fourcc(*'XVID')
-                self.video_writer = cv2.VideoWriter(filename, fourcc, fps, (w, h), isColor=True)
-                
-                if not self.video_writer.isOpened():
-                    self.get_logger().error(f"!!! Failed to open video writer for file: {filename}")
-                    self.record_rgb = False
-                else:
-                    self.is_recording = True
-                    self.get_logger().info(f"SUCCESS: Started recording RGB video to {filename}")
-            except Exception as e:
-                self.get_logger().error(f"!!! EXCEPTION while creating video writer: {e}")
-                self.record_rgb = False
-
-        # 如果正在录制，则写入彩色图像帧
-        if self.is_recording and self.video_writer is not None:
-            # 直接写入彩色图像，无需任何转换
-            self.video_writer.write(color_image)
-            
-        # --- (以下检测逻辑保持不变) ---
+        if self._stop_event.is_set():
+            return
+        # Queue a read-only reference; encoding never runs on this thread.
+        self._offer_recording_frame(color_image)
 
         try:
             depth_scale = depth_scale_for_encoding(
@@ -346,6 +514,18 @@ class YOLOv5ROS2(Node):
 
         selected = choose_highest_confidence_candidate(candidates)
 
+        if self._stop_event.is_set():
+            return
+        # Publish the unchanged 3D result before auxiliary drawing/packing.
+        if selected is not None:
+            X, Y, Z = self.pixel_to_world(
+                selected['center_x'], selected['center_y'],
+                selected['depth_m'], intrinsics=intrinsics,
+            )
+            self.process_and_publish(
+                X, Y, Z, selected['confidence'], observation_header,
+            )
+
         # --- (可选) 调试图像；使用原始 RGB 时间戳与 viewer 缓存帧匹配 ---
         if self.show_image or self.publish_debug_image:
             try:
@@ -356,11 +536,15 @@ class YOLOv5ROS2(Node):
                     and self.debug_image_publisher.get_subscription_count() > 0
                 )
                 if self.show_image or should_publish_debug:
+                    now = time.monotonic()
+                    if now < self._debug_next_at:
+                        return
+                    self._debug_next_at = now + 1.0 / self.debug_image_hz
                     selected_index = None if selected is None else selected['target_index']
                     annotated_image = self.draw_detections(
                         color_image.copy(), results, selected_index
                     )
-                    if should_publish_debug:
+                    if should_publish_debug and not self._stop_event.is_set():
                         debug_msg = self.bridge.cv2_to_imgmsg(
                             annotated_image, encoding='bgr8'
                         )
@@ -368,25 +552,14 @@ class YOLOv5ROS2(Node):
                         self.debug_image_publisher.publish(debug_msg)
                     if self.show_image:
                         self.show_detections(annotated_image)
+                else:
+                    # Reopening a viewer need not wait for an old deadline.
+                    self._debug_next_at = 0.0
             except Exception as exc:
                 self.get_logger().warn(
                     f"Failed to render debug image: {exc}",
                     throttle_duration_sec=2,
                 )
-
-        if selected is not None:
-            X, Y, Z = self.pixel_to_world(
-                selected['center_x'],
-                selected['center_y'],
-                selected['depth_m'],
-            )
-            self.process_and_publish(
-                X,
-                Y,
-                Z,
-                selected['confidence'],
-                observation_header,
-            )
 
     def draw_detections(self, image, detections, selected_index=None):
         for index, det in enumerate(detections):
@@ -408,7 +581,20 @@ class YOLOv5ROS2(Node):
         return image
 
     def show_detections(self, image):
-        cv2.imshow("Detection", image)
+        """Hand local GUI output to the main thread, never a model worker."""
+        with self._display_lock:
+            self._display_frame = image
+            self._display_generation += 1
+
+    def display_latest_debug_frame(self):
+        with self._display_lock:
+            frame = self._display_frame
+            generation = self._display_generation
+        if frame is None:
+            return
+        if generation != self._displayed_generation:
+            cv2.imshow("Detection", frame)
+            self._displayed_generation = generation
         cv2.waitKey(1)
 
     @torch.no_grad()
@@ -433,9 +619,13 @@ class YOLOv5ROS2(Node):
             return float(np.median(valid_depths)) * depth_scale
         return 0.0
 
-    def pixel_to_world(self, u, v, depth):
-        X = (u - self.cx) * depth / self.fx
-        Y = (v - self.cy) * depth / self.fy
+    def pixel_to_world(self, u, v, depth, intrinsics=None):
+        fx, fy, cx, cy = (
+            (self.fx, self.fy, self.cx, self.cy)
+            if intrinsics is None else intrinsics
+        )
+        X = (u - cx) * depth / fx
+        Y = (v - cy) * depth / fy
         Z = depth
         return X, Y, Z
 
@@ -457,14 +647,21 @@ class YOLOv5ROS2(Node):
             self.publisher.publish(point_msg)
         self.get_logger().info(
             'Published Target: X=%.3f, Y=%.3f, Z=%.3f, confidence=%.3f'
-            % (X, Y, Z, confidence)
+            % (X, Y, Z, confidence),
+            throttle_duration_sec=2,
         )
 
 def main(args=None):
     rclpy.init(args=args)
     node = YOLOv5ROS2()
     try:
-        rclpy.spin(node)
+        node.start_workers()
+        if node.show_image:
+            while rclpy.ok():
+                rclpy.spin_once(node, timeout_sec=1.0 / 30.0)
+                node.display_latest_debug_frame()
+        else:
+            rclpy.spin(node)
     except KeyboardInterrupt:
         node.get_logger().info('KeyboardInterrupt received, shutting down.')
     finally:
