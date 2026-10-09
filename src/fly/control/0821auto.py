@@ -387,6 +387,11 @@ class OffboardControl(Node):
 
         self.alignment_altitude_threshold = args.alignment_altitude_threshold
 
+        #新增：保存命令行配置的第二次对准高度悬停时长。
+        self.second_alignment_hover_duration_s = (
+            args.second_alignment_hover_duration
+        )
+
 
         # <<< 新增：从命令行参数初始化侦察任务参数 >>>
         self.recon_search_height = args.recon_search_height
@@ -425,7 +430,12 @@ class OffboardControl(Node):
         self.is_FinishDrop = False
 
         self.reached_align_height = False
+        self.first_alignment_hold_xy = None #新增的用于冻结xy坐标的参数
+        self.second_alignment_height_reached = False #新增用于冻结坐标xy的参数
 
+        #新增：到达第二次对准高度后，固定水平设定点悬停一段时间。
+        self.second_alignment_hover_started_at = None
+        self.second_alignment_hover_complete = False
 
         self.postdrop_waiting_x = None
         self.postdrop_waiting_y = None
@@ -669,6 +679,13 @@ class OffboardControl(Node):
     def _deactivate_final_alignment(self):
         self.is_final_aligning = False
         self._reset_target_context(False)
+        #新增代码用于清空第一次对准的冻结坐标：
+        self.first_alignment_hold_xy = None
+        self.second_alignment_height_reached = False
+        #新增：退出当前目标时清除悬停计时，避免影响下一目标或后续任务。
+        self.second_alignment_hover_started_at = None
+        self.second_alignment_hover_complete = False
+
 
     def _capture_control_snapshot(self):
         """Freeze received state once per control cycle, outside heavy work."""
@@ -1597,6 +1614,7 @@ class OffboardControl(Node):
                 if not self._alignment_commit_is_current():
                     return
                 self.first_alignment_complete = True
+                self.first_alignment_hold_xy = (float(current_x), float(current_y)) #新增用于冻结xy坐标的计算
                 self._pause_alignment_timeout('first')
                 self.second_align_start_timestamp = None
                 self.second_align_accumulated_s = 0.0
@@ -1844,6 +1862,9 @@ class OffboardControl(Node):
         self.integral_y = 0.0
         self.last_error_x = 0.0
         self.last_error_y = 0.0
+        #新增代码用于重置冻结的第一次对准坐标
+        self.first_alignment_hold_xy = None
+        self.second_alignment_height_reached = False
 
         # 重置TARGETING_CYCLE的内部状态
         self.is_navigating_to_target = False
@@ -1900,6 +1921,13 @@ class OffboardControl(Node):
         self.is_navigating_to_target = False
         self.is_final_aligning = True
         self._reset_target_context(True, self.final_alignment_started_at_s)
+        #新增代码用于清理冻结位置
+        self.first_alignment_hold_xy = None
+        self.second_alignment_height_reached = False
+        #新增：开始新的最终对准时重新初始化悬停状态。
+        self.second_alignment_hover_started_at = None
+        self.second_alignment_hover_complete = False
+
 
     def _start_smooth_move(self, end_pos_ned: tuple):
         """
@@ -1968,6 +1996,12 @@ class OffboardControl(Node):
             z_reference_changed = (
                 current_reset_state[1] != self.target_anchor_reset_state[1]
             )
+            #新增代码用于冻结第一次对准xy坐标
+            if self.first_alignment_hold_xy is not None:
+                self.first_alignment_hold_xy = (
+                    float(self.vehicle_local_position.x),
+                    float(self.vehicle_local_position.y),
+                )
             self._invalidate_target_anchor(
                 "PX4本地位置或航向参考已重置：丢弃旧NED目标并等待新图像。",
                 rebase_height=z_reference_changed,
@@ -2034,16 +2068,84 @@ class OffboardControl(Node):
             second_target_z,
             self.alignment_altitude_threshold,
         )
+        # 到达第二次对准高度后，对本目标记一次“已到达”。
+        # 后续若高度轻微波动，不重新切回第一次对准时的冻结 x/y。
+        if (
+            self.first_alignment_complete
+            and not self.second_alignment_complete
+            and second_altitude_ok
+        ):
+            self.second_alignment_height_reached = True
+        
+        #新增：首次到达第二次对准高度时，启动一次性悬停计时。
+        #新增：使用单调时钟计时，避免 ROS 时钟跳变影响悬停时长。
+        if (
+            self.first_alignment_complete
+            and not self.second_alignment_complete
+            and second_altitude_ok
+            and not self.second_alignment_hover_complete
+            and self.second_alignment_hover_started_at is None
+        ):
+            self.second_alignment_hover_started_at = time.monotonic()
+            self.get_logger().info(
+                "到达第二次对准高度，开始悬停 %.2f 秒。"
+                % self.second_alignment_hover_duration_s
+            )
+
+        #新增：悬停期间持续发布保持点；计时结束后只退出一次，不会重新启动。
+        second_alignment_hover_active = False
+        if (
+            self.first_alignment_complete
+            and not self.second_alignment_complete
+            and self.second_alignment_hover_started_at is not None
+        ):
+            hover_elapsed_s = (
+                time.monotonic() - self.second_alignment_hover_started_at
+            )
+            if hover_elapsed_s < self.second_alignment_hover_duration_s:
+                second_alignment_hover_active = True
+            else:
+                self.second_alignment_hover_started_at = None
+                self.second_alignment_hover_complete = True
+                self.get_logger().info(
+                    "第二次对准高度悬停结束，恢复正常对准逻辑。"
+                )
+
+        # 仅在第一次对准已完成、第二次对准尚未完成、
+        # 且还没有到过第二次高度时，保持第一次对准成功时的 x/y。
+        hold_first_alignment_xy = (
+            self.first_alignment_complete
+            and not self.second_alignment_complete
+            and not self.second_alignment_height_reached
+        )
+
+        # 正常情况下第一次对准成功时已经记录冻结坐标。
+        # 若状态异常导致它缺失，用当前飞机位置兜底，避免解包 None。
+        if hold_first_alignment_xy and self.first_alignment_hold_xy is None:
+            self.first_alignment_hold_xy = (
+                float(self.vehicle_local_position.x),
+                float(self.vehicle_local_position.y),
+            )
+            self.get_logger().warn(
+                "下降保持位置未初始化，改用当前位置锁定水平 setpoint。"
+            )          
+
+
         first_stage_eligible = alignment_data_valid and first_altitude_ok
         second_stage_eligible = alignment_data_valid and second_altitude_ok
 
         ned_fix_locked = False
-        if self.target_anchor_tracker.selection_mode == 'ned-fix':
+        #新增：悬停期间不推进 ned-fix 的控制确认计时。
+        if (
+            self.target_anchor_tracker.selection_mode == 'ned-fix'
+            and not second_alignment_hover_active
+        ):
             just_fixed = self._update_ned_fix(
                 now_s, snapshot, p_dropper_in_world,
                 is_in_second_alignment and second_stage_eligible,
             )
             ned_fix_locked = snapshot.ned_fixed or just_fixed
+
 
         if is_in_first_alignment and not first_stage_eligible:
             if self.first_align_start_timestamp is not None:
@@ -2108,8 +2210,16 @@ class OffboardControl(Node):
 
                     return
 
+        #新增：悬停期间暂停二次对准超时累计，避免等待时间触发超时投放。
+        if second_alignment_hover_active:
+            self._pause_alignment_timeout('second')
+
         # 第二阶段只有在新鲜目标和有效飞机位姿同时存在时才累计超时。
-        if is_in_second_alignment and second_stage_eligible:
+        if (
+            is_in_second_alignment
+            and second_stage_eligible
+            and not second_alignment_hover_active
+        ):
             # 启动计时器 (如果尚未启动)
             if self.second_align_start_timestamp is None:
                 self.second_align_start_timestamp = self.get_clock().now()
@@ -2284,9 +2394,39 @@ class OffboardControl(Node):
             elif self.first_alignment_complete and not self.second_alignment_complete:
                 if self.log_counter % 25 == 0:
                     self.get_logger().info("执行第二次精确对准")
-                target_z = second_target_z
-                self.fly_to_position(target_x_NED, target_y_NED, target_z)
 
+                target_z = second_target_z
+
+                # 下降到第二次对准高度前，保持第一次对准成功时的飞机水平位置。
+                # 这期间不发布锚点/PID算出来的 x/y。
+                #新增：下降阶段或到达高度后的悬停阶段，都保持第一次对准记录的 x/y。
+                if hold_first_alignment_xy or second_alignment_hover_active:
+                    self.integral_x = 0.0
+                    self.integral_y = 0.0
+                    self.last_error_x = 0.0
+                    self.last_error_y = 0.0
+
+                    #新增：正常流程已有冻结值；若状态异常缺失，则在当前位置保持，避免解包 None。
+                    hold_xy = self.first_alignment_hold_xy
+                    if hold_xy is None:
+                        hold_xy = (
+                            float(self.vehicle_local_position.x),
+                            float(self.vehicle_local_position.y),
+                        )
+                        self.first_alignment_hold_xy = hold_xy
+
+                    setpoint_x = hold_xy[0]
+                    setpoint_y = hold_xy[1]
+                else:
+                    # 到过第二次对准高度后，恢复现有锚点/PID水平控制路径。
+                    setpoint_x = target_x_NED
+                    setpoint_y = target_y_NED
+
+                # 本分支每个控制周期只发布一次 setpoint。
+                self.fly_to_position(setpoint_x, setpoint_y, target_z)
+
+                # 保留原有高度门控：高度偏差时重置第二次对准稳定计时；
+                # 达到高度后再开始检查水平对准。
                 if not second_altitude_ok:
                     if self.reached_align_height:
                         self.second_alignment_checker.reset()
@@ -2300,19 +2440,22 @@ class OffboardControl(Node):
                     self.get_logger().warn(
                         "高度达到，开始检查第二次水平对准精度。"
                     )
-                elif second_stage_eligible:
+                #新增：悬停期间不运行二次水平对准检查；悬停结束后恢复原检查。
+                elif second_stage_eligible and not second_alignment_hover_active:
                     self.second_alignment_check(
                         precise_target_x_NED,
                         precise_target_y_NED,
                     )
 
-                self.last_found_x_NED = target_x_NED
-                self.last_found_y_NED = target_y_NED
+                # 记录实际发布的目标点，供锚点失效时的 fallback 使用。
+                # 下降期间这里记录的是冻结 x/y，而不是没有发布的锚点/PID x/y。
+                self.last_found_x_NED = setpoint_x
+                self.last_found_y_NED = setpoint_y
                 self.last_found_z_NED = target_z
 
             # ============== 投水逻辑 ==============
             if self.first_alignment_complete and self.second_alignment_complete and not self.is_drop_initiated_for_current_target:
-    # 只负责启动，不设置完成标志
+            # 只负责启动，不设置完成标志
                 if self.current_dropping_state[1] == DroppingState.IDLE and not self.Is_Finish_1st_Drop:
                     if not self._drop_aligned_payload(1):
                         return
@@ -2361,29 +2504,67 @@ class OffboardControl(Node):
 
 
         else:
-            # 锚点过期后冻结最后一个绝对NED设定点，避免“原地等待”随风漂移。
-            if all(value is not None for value in (
+            #新增：锚点失效时，下降阶段或悬停阶段仍保持第一次对准的水平位置。
+            if hold_first_alignment_xy or second_alignment_hover_active:
+        # 即使锚点已经过期，下降期间仍保持第一次对准时的 x/y，
+        # 并继续向第二次对准高度下降。
+                #新增：冻结位置缺失时以当前位置作为安全的水平保持点。
+                hold_xy = self.first_alignment_hold_xy
+                if hold_xy is None:
+                    hold_xy = (
+                        float(self.vehicle_local_position.x),
+                        float(self.vehicle_local_position.y),
+                    )
+                    self.first_alignment_hold_xy = hold_xy
+
+                hold_x, hold_y = hold_xy
+                hold_z = second_target_z
+
+                if self.log_counter % 25 == 0:
+                    self.get_logger().info(
+                        "目标锚点暂不可用；下降期间保持第一次对准的水平位置。"
+                    )
+
+                self.fly_to_position(hold_x, hold_y, hold_z)
+
+        # 保存本次实际发布的 setpoint，供后续无锚点等待使用。
+                self.last_found_x_NED = hold_x
+                self.last_found_y_NED = hold_y
+                self.last_found_z_NED = hold_z
+
+            elif all(value is not None for value in (
                 self.last_found_x_NED,
                 self.last_found_y_NED,
                 self.last_found_z_NED,
             )):
+                # 不在下降冻结阶段时，保持原先最后一个绝对 NED setpoint。
                 if self.log_counter % 25 == 0:
-                    self.get_logger().info("目标锚点已过期，保持最后绝对NED设定点。")
-                self.fly_to_position(self.last_found_x_NED, self.last_found_y_NED, self.last_found_z_NED)
+                    self.get_logger().info(
+                        "目标锚点已过期，保持最后绝对NED设定点。"
+                    )
+
+                self.fly_to_position(
+                    self.last_found_x_NED,
+                    self.last_found_y_NED,
+                    self.last_found_z_NED,
+                )
+
             else:
+                # 没有锚点记录时，按当前任务阶段在当前位置悬停。
                 if self.log_counter % 25 == 0:
                     self.get_logger().info("无目标记录，原地等待")
+
                 hold_z = (
-                    self.takeoff_target_height + self.afterAlign_descentHeight
+                    second_target_z
                     if self.first_alignment_complete
                     else self.takeoff_target_height
                 )
+
                 self.fly_to_position(
                     self.vehicle_local_position.x,
                     self.vehicle_local_position.y,
                     hold_z,
                 )
-
 
     def _collect_global_search_map_sample(self, vision_info, sample_pose):
         """
@@ -3743,6 +3924,9 @@ def main(args=None) -> None:
     parser.add_argument('--max-smoothing-duration', type=float, default=8.0,
                         help='Maximum duration (seconds) for any smooth move to cap long-distance travel time.')
 
+    #新增：到达第二次对准高度后，悬停等待的时间；默认 1 秒。
+    parser.add_argument('--second-alignment-hover-duration',type=float,default=1.0,help='到达第二次对准高度后、开始二次水平对准前的悬停时间（秒）；设为 0 可关闭悬停。')
+
     # 3. 解析参数
     # 使用 rclpy.utilities.remove_ros_args 来确保我们只解析自己的参数，
     # 这样可以安全地与 ROS2 的参数（如 --ros-args）一起使用。
@@ -3839,6 +4023,14 @@ def main(args=None) -> None:
         parser.error('--widecam-map-outlier-floor must be positive')
     if custom_args.widecam_max_pose_attitude_skew <= 0.0:
         parser.error('--widecam-max-pose-attitude-skew must be positive')
+    #新增：悬停时长必须是有限的非负数；0 表示不等待，直接恢复二次对准。
+    if (
+        not math.isfinite(custom_args.second_alignment_hover_duration)
+        or custom_args.second_alignment_hover_duration < 0.0
+    ):
+        parser.error(
+            '--second-alignment-hover-duration must be finite and non-negative'
+        )
 
     TARGET_MAP = {
         1: "Left",
