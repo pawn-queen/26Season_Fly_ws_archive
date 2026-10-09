@@ -65,6 +65,7 @@ class TargetSnapshot:
     jump_seq: int
     session_epoch: int
     ned_epoch: int
+    ned_fixed: bool
 
 class DroppingState(Enum):
     IDLE = 0
@@ -622,6 +623,7 @@ class OffboardControl(Node):
             tracker.anchor_ned, tracker.anchor_confidence,
             tracker.last_observation_at_s, self._discontinuity_seq,
             self._jump_seq, self._session_epoch, self._alignment_ned_epoch,
+            tracker.ned_fixed,
         )
 
     def _install_target_snapshot(self, snapshot):
@@ -2035,11 +2037,13 @@ class OffboardControl(Node):
         first_stage_eligible = alignment_data_valid and first_altitude_ok
         second_stage_eligible = alignment_data_valid and second_altitude_ok
 
+        ned_fix_locked = False
         if self.target_anchor_tracker.selection_mode == 'ned-fix':
-            self._update_ned_fix(
+            just_fixed = self._update_ned_fix(
                 now_s, snapshot, p_dropper_in_world,
                 is_in_second_alignment and second_stage_eligible,
             )
+            ned_fix_locked = snapshot.ned_fixed or just_fixed
 
         if is_in_first_alignment and not first_stage_eligible:
             if self.first_align_start_timestamp is not None:
@@ -2194,7 +2198,10 @@ class OffboardControl(Node):
             # === 2. 将精确误差 "喂" 给你的PID控制器 ===
             distance = math.hypot(error_frd_x, error_frd_y)
 
-            if distance < self.epsilon and alignment_data_valid:
+            if ned_fix_locked:
+                # 固定后直接使用补偿投放器偏移的NED目标，清除旧PID历史。
+                self.integral_x, self.integral_y, self.last_error_x, self.last_error_y = 0.0, 0.0, 0.0, 0.0
+            elif distance < self.epsilon and alignment_data_valid:
                 # ——— PID细调阶段 (使用新的精确误差) ———
                 if self.log_counter % 25 == 0: self.get_logger().info(f"PID细调阶段 - 精确误差:{distance:.3f}m")
                 error_x = error_frd_x
@@ -2244,16 +2251,20 @@ class OffboardControl(Node):
                 control_y = error_frd_y * scale
                 self.integral_x, self.integral_y, self.last_error_x, self.last_error_y = 0.0, 0.0, 0.0, 0.0
 
-            # PID输出属于当前机体FRD，必须按当前航向转回NED。
-            target_x_NED, target_y_NED = self.coordinate_current_FRD2NED(
-                control_x,
-                control_y,
-            )
-
             # === 4. [修改部分] 计算用于对准检查的精确目标点 ===
             # 检查点 = 无人机当前位置 + NED误差向量 (即我们希望无人机飞到的位置)
             precise_target_x_NED = self.vehicle_local_position.x + error_ned[0]
             precise_target_y_NED = self.vehicle_local_position.y + error_ned[1]
+
+            if ned_fix_locked:
+                target_x_NED = precise_target_x_NED
+                target_y_NED = precise_target_y_NED
+            else:
+                # PID输出属于当前机体FRD，必须按当前航向转回NED。
+                target_x_NED, target_y_NED = self.coordinate_current_FRD2NED(
+                    control_x,
+                    control_y,
+                )
 
             # ============== 两次对准逻辑 ==============
             # First alignment
