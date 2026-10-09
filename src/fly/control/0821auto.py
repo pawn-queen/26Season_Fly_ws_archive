@@ -757,7 +757,7 @@ class OffboardControl(Node):
                 )
         if fixed:
             self.get_logger().info(
-                "ned-fix固定目标NED: (%.3f, %.3f, %.3f)" % snapshot.anchor_ned
+                "：）））！！！！！！！！！！！！！！！！锁上了！！！！！！！！！ned-fix固定目标NED: (%.3f, %.3f, %.3f)！！！！！！！！！！锁上了！！！！！！！！！" % snapshot.anchor_ned
             )
         return fixed
 
