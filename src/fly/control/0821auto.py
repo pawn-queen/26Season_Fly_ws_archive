@@ -8,6 +8,7 @@ from geometry_msgs.msg import Point
 from std_msgs.msg import Float32
 from sensor_msgs.msg import Image, PointCloud
 from collections import deque
+from dataclasses import dataclass, replace
 import time
 from control.DronePositionChecker import DronePositionChecker
 from control.AlignmentChecker import AlignmentChecker
@@ -24,7 +25,6 @@ from enum import Enum
 import subprocess
 import re
 import os
-import csv
 import argparse # <<< 新增
 import sys      # <<< 新增
 import threading
@@ -32,7 +32,39 @@ import traceback
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor, ShutdownException
+from rclpy.executors import ExternalShutdownException, ShutdownException
+from control.priority_executor import PriorityExecutor
+
+
+@dataclass(frozen=True)
+class PoseSnapshot:
+    position: object
+    roll: float
+    pitch: float
+    attitude_timestamp_us: object
+    position_received_ns: object
+    attitude_received_ns: object
+    reset_state: tuple
+    ned_epoch: int = 0
+    z_reset_epoch: int = 0
+    sequence: int = 0
+
+
+@dataclass(frozen=True)
+class TargetSnapshot:
+    point: object
+    confidence: object
+    received_at: object
+    confident_received_at: object
+    measurement_time_s: object
+    reset_state: object
+    anchor_ned: object
+    anchor_confidence: object
+    last_observation_at_s: object
+    discontinuity_seq: int
+    jump_seq: int
+    session_epoch: int
+    ned_epoch: int
 
 class DroppingState(Enum):
     IDLE = 0
@@ -89,13 +121,17 @@ class OffboardControl(Node):
         # 将任务状态机、视觉推理、USB 相机和 Offboard 心跳隔离。
         # 每组内部仍然互斥，避免同一类有状态回调重入。
         self.mission_callback_group = MutuallyExclusiveCallbackGroup()
+        self.target_callback_group = MutuallyExclusiveCallbackGroup()
+        self.pose_callback_group = MutuallyExclusiveCallbackGroup()
         self.vision_callback_group = MutuallyExclusiveCallbackGroup()
         self.heartbeat_callback_group = MutuallyExclusiveCallbackGroup()
         self.image_callback_group = MutuallyExclusiveCallbackGroup()
         self.widecam_debug_callback_group = MutuallyExclusiveCallbackGroup()
 
         # 多线程执行器下，共享数据必须以完整快照为单位交换。
-        self._pose_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        # Lock order is commit -> state; no state lock is held during publish.
+        self._position_commit_lock = threading.Lock()
         self._frame_lock = threading.Lock()
         self._vision_result_lock = threading.Lock()
         self._map_data_lock = threading.Lock()
@@ -116,25 +152,25 @@ class OffboardControl(Node):
         # Create subscribers
         self.vehicle_local_position_subscriber = self.create_subscription(
             VehicleLocalPosition, '/fmu/out/vehicle_local_position_v1', self.vehicle_local_position_callback,
-            qos_profile, callback_group=self.mission_callback_group)
+            qos_profile, callback_group=self.pose_callback_group)
         self.vehicle_status_subscriber = self.create_subscription(
             VehicleStatus, '/fmu/out/vehicle_status_v1', self.vehicle_status_callback,
-            qos_profile, callback_group=self.mission_callback_group)
+            qos_profile, callback_group=self.target_callback_group)
         self.target_position_subscriber = self.create_subscription(Point, '/target_position',
                                                                    self.target_position_callback,
                                                                    target_qos_profile,
-                                                                   callback_group=self.mission_callback_group)
+                                                                   callback_group=self.target_callback_group)
         self.target_observation_subscriber = self.create_subscription(
             PointCloud,
             '/target_observation',
             self.target_observation_callback,
             target_qos_profile,
-            callback_group=self.mission_callback_group,
+            callback_group=self.target_callback_group,
         )
 
         self.vehicle_odometry_subscriber = self.create_subscription(
             VehicleOdometry, '/fmu/out/vehicle_odometry', self.vehicle_odometry_callback,
-            qos_profile, callback_group=self.mission_callback_group)
+            qos_profile, callback_group=self.pose_callback_group)
 
         #这是广角相机的内参和畸变参数
         self.camera_matrix = np.array([
@@ -319,8 +355,6 @@ class OffboardControl(Node):
 
         self.target_position = None
         self.target_confidence = None
-        self.target_observation_sequence = 0
-        self.last_logged_target_observation_sequence = -1
         self.last_confident_target_update_time = None
         self.last_target_measurement_time_s = None
         self.final_alignment_started_at_s = None
@@ -423,6 +457,7 @@ class OffboardControl(Node):
         self.target_anchor_jump_pending = False
         self.target_anchor_reset_state = None
         self.alignment_target_was_fresh = False
+        self._initialize_shared_state()
 
 
         ### 新增: 用于稳定建图的数据收集变量 ###
@@ -436,27 +471,6 @@ class OffboardControl(Node):
         self.servo_step_delay = args.servo_step_delay  # 每个舵机动作之间的延迟（秒），可以根据实际情况调整
         self.current_dropping_state = {1: DroppingState.IDLE, 2: DroppingState.IDLE}
         self.last_servo_command_time = {1: None, 2: None}
-
-        # ========== 目标像素坐标日志 ==========
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        log_dir = '/home/pixel/flylogs'
-        log_filename = f'bucket_pixel_log_{timestamp}.csv'
-        os.makedirs(log_dir, exist_ok=True)
-        self.pixel_log_path = os.path.join(log_dir, log_filename)
-
-        # 打开文件并保留文件句柄和writer对象
-        self.pixel_log_file = open(self.pixel_log_path, 'w', newline='', encoding='utf-8')
-        self.pixel_log_writer = csv.writer(self.pixel_log_file)
-        # 写入表头
-        self.pixel_log_writer.writerow([
-            'timestamp',
-            'target_x',
-            'target_y',
-            'target_confidence',
-            'alignment_stage',
-        ])
-        self.get_logger().info(f"日志文件已创建并打开: {self.pixel_log_path}")
-        # ===========================================================================
 
         # Create a timer to publish control commands
         self.dt = args.timer_period             # 控制周期 (秒) - 与timer频率一致
@@ -566,21 +580,206 @@ class OffboardControl(Node):
         self.recon_hover_start_time = None       # 到达侦察点后，悬停开始时间
         self.is_hovering_at_recon_point = False  # 是否正在悬停侦察的标志
 
-    def _record_target_pose_sample(self):
+    def _initialize_shared_state(self):
+        """Initialize ingress state before any executor can run callbacks."""
+        self._received_pose = PoseSnapshot(
+            self.vehicle_local_position, self.vehicle_roll, self.vehicle_pitch,
+            self.vehicle_attitude_timestamp_us, None, None,
+            self._local_position_reset_state(),
+        )
+        self._received_vehicle_status = self.vehicle_status
+        self._control_pose_snapshot = self._received_pose
+        self._control_ned_epoch = 0
+        self._control_z_reset_epoch = 0
+        self._session_epoch = 0
+        self._alignment_active = False
+        self._alignment_started_at_s = None
+        self._alignment_ned_epoch = 0
+        self._received_target_point = None
+        self._received_target_confidence = None
+        self._received_target_at = None
+        self._received_confident_target_at = None
+        self._received_measurement_time_s = None
+        self._received_target_reset_state = None
+        self._discontinuity_seq = 0
+        self._jump_seq = 0
+        self._consumed_discontinuity_seq = 0
+        self._consumed_jump_seq = 0
+        self._control_target_snapshot = self._target_snapshot_locked()
+
+    def _target_snapshot_locked(self):
+        """Caller holds the state lock; never expose the mutable tracker."""
+        tracker = self.target_anchor_tracker
+        return TargetSnapshot(
+            self._received_target_point, self._received_target_confidence,
+            self._received_target_at, self._received_confident_target_at,
+            self._received_measurement_time_s, self._received_target_reset_state,
+            tracker.anchor_ned, tracker.anchor_confidence,
+            tracker.last_observation_at_s, self._discontinuity_seq,
+            self._jump_seq, self._session_epoch, self._alignment_ned_epoch,
+        )
+
+    def _install_target_snapshot(self, snapshot):
+        """Only the control group writes these per-cycle task cache fields."""
+        self._control_target_snapshot = snapshot
+        self.target_position = (
+            None if snapshot.point is None else Point(
+                x=snapshot.point[0], y=snapshot.point[1], z=snapshot.point[2]
+            )
+        )
+        self.target_confidence = snapshot.confidence
+        self.last_target_update_time = snapshot.received_at
+        self.last_confident_target_update_time = snapshot.confident_received_at
+        self.last_target_measurement_time_s = snapshot.measurement_time_s
+        self.target_anchor_reset_state = snapshot.reset_state
+        self.target_stream_discontinuity_pending = (
+            snapshot.discontinuity_seq > self._consumed_discontinuity_seq
+        )
+        self.target_anchor_jump_pending = snapshot.jump_seq > self._consumed_jump_seq
+
+    def _reset_target_context(self, active, started_at_s=None):
+        """Atomically invalidate in-flight observations at a task boundary."""
+        with self._state_lock:
+            self._session_epoch += 1
+            self._alignment_active = active
+            self._alignment_started_at_s = started_at_s
+            self._alignment_ned_epoch = self._control_ned_epoch
+            self.target_anchor_tracker.reset()
+            self._received_target_point = None
+            self._received_target_confidence = None
+            self._received_target_at = None
+            self._received_confident_target_at = None
+            self._received_measurement_time_s = None
+            self._received_target_reset_state = (
+                self._local_position_reset_state() if active else None
+            )
+            snapshot = self._target_snapshot_locked()
+            # A later event must remain pending; acknowledge only this boundary.
+            self._consumed_discontinuity_seq = snapshot.discontinuity_seq
+            self._consumed_jump_seq = snapshot.jump_seq
+        self._install_target_snapshot(snapshot)
+
+    def _deactivate_final_alignment(self):
+        self.is_final_aligning = False
+        self._reset_target_context(False)
+
+    def _capture_control_snapshot(self):
+        """Freeze received state once per control cycle, outside heavy work."""
+        with self._state_lock:
+            pose = self._received_pose
+            status = self._received_vehicle_status
+            ned_changed = pose.ned_epoch != self._control_ned_epoch
+            snapshot = self._target_snapshot_locked()
+        z_changed = pose.z_reset_epoch != self._control_z_reset_epoch
+        self._control_pose_snapshot = pose
+        self.vehicle_local_position = pose.position
+        self.vehicle_roll = pose.roll
+        self.vehicle_pitch = pose.pitch
+        self.vehicle_attitude_timestamp_us = pose.attitude_timestamp_us
+        self.vehicle_status = status
+        self._control_ned_epoch = pose.ned_epoch
+        self._control_z_reset_epoch = pose.z_reset_epoch
+        if ned_changed and self.is_final_aligning:
+            self._invalidate_target_anchor(
+                "PX4位姿接收组检测到本地NED参考重置：丢弃旧目标锚点。",
+                rebase_height=z_changed,
+            )
+        else:
+            self._install_target_snapshot(snapshot)
+
+    def _refresh_control_target_snapshot(self, now_s):
+        """Refresh only in the original active alignment control branch."""
+        with self._state_lock:
+            if (
+                not self._alignment_active
+                or self._received_pose.ned_epoch != self._control_ned_epoch
+                or self._session_epoch != self._control_target_snapshot.session_epoch
+            ):
+                return False
+            old_anchor = self.target_anchor_tracker.anchor_ned
+            self.target_anchor_tracker.refresh(now_s)
+            new_anchor = self.target_anchor_tracker.anchor_ned
+            if old_anchor is not None and new_anchor is not None:
+                if math.hypot(
+                    new_anchor[0] - old_anchor[0], new_anchor[1] - old_anchor[1],
+                ) >= self.second_alignment_checker.threshold:
+                    self._jump_seq += 1
+            snapshot = self._target_snapshot_locked()
+        self._install_target_snapshot(snapshot)
+        return True
+
+    def _alignment_commit_is_current(self):
+        """Check reset/event versions before committing successful alignment."""
+        snapshot = self._control_target_snapshot
+        with self._state_lock:
+            return (
+                self._alignment_active
+                and self._received_pose.ned_epoch == self._control_ned_epoch
+                and self._session_epoch == snapshot.session_epoch
+                and self._discontinuity_seq == snapshot.discontinuity_seq
+                and self._jump_seq == snapshot.jump_seq
+            )
+
+    def _drop_aligned_payload(self, number):
+        """Do not turn an invalidated precision result into a normal drop."""
+        with self._position_commit_lock:
+            if not self._alignment_commit_is_current():
+                self.second_alignment_complete = False
+                return False
+            self.drop_payload(number)
+        return True
+
+    def _consume_target_events(self, alignment_data_valid):
+        """Preserve original reset priority without clearing concurrent events."""
+        snapshot = self._control_target_snapshot
+        if self.target_stream_discontinuity_pending:
+            self._reset_active_alignment_tracking(
+                "目标观测时间不连续：重新开始连续对准计时。",
+                reset_timeout=True,
+            )
+            self._consumed_discontinuity_seq = snapshot.discontinuity_seq
+            self._consumed_jump_seq = snapshot.jump_seq
+            self.target_stream_discontinuity_pending = False
+            self.target_anchor_jump_pending = False
+            self.alignment_target_was_fresh = False
+        elif self.alignment_target_was_fresh and not alignment_data_valid:
+            self._reset_active_alignment_tracking(
+                "目标观测中断：重置连续对准计时，但短时继续追踪固定NED锚点。"
+            )
+            self._consumed_jump_seq = snapshot.jump_seq
+            self.target_anchor_jump_pending = False
+        elif alignment_data_valid and self.target_anchor_jump_pending:
+            self._reset_active_alignment_tracking(
+                "最高置信度目标锚点发生明显变化：重新开始连续对准计时。",
+                reset_timeout=True,
+            )
+            self._consumed_jump_seq = snapshot.jump_seq
+            self.target_anchor_jump_pending = False
+        self.alignment_target_was_fresh = alignment_data_valid
+
+    def _record_target_pose_sample(self, pose=None):
         """Store the current vehicle pose on the ROS clock for image matching."""
-        position = self.vehicle_local_position
+        if pose is None:
+            with self._state_lock:
+                pose = self._received_pose
+        position = pose.position
         position_timestamp_us = (
             getattr(position, 'timestamp_sample', 0)
             or getattr(position, 'timestamp', 0)
         )
         if not px4_pose_attitude_timestamps_match(
             position_timestamp_us,
-            self.vehicle_attitude_timestamp_us,
+            pose.attitude_timestamp_us,
             self.target_pose_attitude_max_skew,
         ):
             return
 
-        body_to_ned = self._body_to_ned_rotation()
+        values = (pose.roll, pose.pitch, position.heading)
+        body_to_ned = (
+            R.from_euler('xyz', values).as_matrix()
+            if all(math.isfinite(value) for value in values)
+            and getattr(position, 'heading_good_for_control', True) else None
+        )
         position_ned = np.array([position.x, position.y, position.z], dtype=float)
         position_valid = (
             getattr(position, 'xy_valid', True)
@@ -593,36 +792,48 @@ class OffboardControl(Node):
         ):
             return
         now_s = self.get_clock().now().nanoseconds / 1e9
-        reset_state = self._local_position_reset_state()
-        if self.target_pose_history:
-            last_time_s, _, _, last_reset_state = self.target_pose_history[-1]
-            if now_s < last_time_s or reset_state != last_reset_state:
-                self.target_pose_history.clear()
-        self.target_pose_history.append(
-            (now_s, position_ned, body_to_ned, reset_state)
-        )
+        position_ned.setflags(write=False)
+        body_to_ned.setflags(write=False)
+        with self._state_lock:
+            if pose.ned_epoch != self._received_pose.ned_epoch:
+                return
+            if self.target_pose_history:
+                last_time_s, _, _, last_reset_state = self.target_pose_history[-1]
+                if now_s < last_time_s or pose.reset_state != last_reset_state:
+                    self.target_pose_history.clear()
+            self.target_pose_history.append(
+                (now_s, position_ned, body_to_ned, pose.reset_state)
+            )
 
-    def _target_pose_at(self, measurement_time_s):
+    def _target_pose_at(self, measurement_time_s, expected_ned_epoch=None):
         """Return the pose nearest an image timestamp, or ``None`` if too far."""
+        with self._state_lock:
+            pose = self._received_pose
+            history = tuple(self.target_pose_history)
+        if expected_ned_epoch is not None and pose.ned_epoch != expected_ned_epoch:
+            return None
         if measurement_time_s is None:
-            if not self.target_pose_history:
+            if not history:
                 return None
             sample_time_s, position_ned, body_to_ned, reset_state = (
-                self.target_pose_history[-1]
+                history[-1]
             )
             sample_age_s = (
                 self.get_clock().now().nanoseconds / 1e9 - sample_time_s
             )
             if not 0.0 <= sample_age_s <= self.target_pose_max_skew:
                 return None
-            return position_ned, body_to_ned, reset_state
+            return (
+                (position_ned, body_to_ned, reset_state)
+                if reset_state == pose.reset_state else None
+            )
 
         if not math.isfinite(measurement_time_s):
             return None
-        if not self.target_pose_history:
+        if not history:
             return None
         sample_time_s, position_ned, body_to_ned, reset_state = min(
-            self.target_pose_history,
+            history,
             key=lambda sample: abs(sample[0] - measurement_time_s),
         )
         pose_skew_s = abs(sample_time_s - measurement_time_s)
@@ -632,7 +843,10 @@ class OffboardControl(Node):
                 throttle_duration_sec=2,
             )
             return None
-        return position_ned, body_to_ned, reset_state
+        return (
+            (position_ned, body_to_ned, reset_state)
+            if reset_state == pose.reset_state else None
+        )
 
     def _store_target_observation(
         self,
@@ -643,7 +857,13 @@ class OffboardControl(Node):
         measurement_time_s=None,
     ):
         """Validate one camera observation and immediately anchor it in NED."""
-        if not self.is_final_aligning:
+        with self._state_lock:
+            active = self._alignment_active
+            session_epoch = self._session_epoch
+            ned_epoch = self._alignment_ned_epoch
+            started_at_s = self._alignment_started_at_s
+            pose_epoch = self._received_pose.ned_epoch
+        if not active or pose_epoch != ned_epoch:
             return
         if self.target_anchor_tracker.lock_enabled and confidence is None:
             return
@@ -670,8 +890,8 @@ class OffboardControl(Node):
             now_s if measurement_time_s is None else float(measurement_time_s)
         )
         if (
-            self.final_alignment_started_at_s is not None
-            and observation_time_s < self.final_alignment_started_at_s
+            started_at_s is not None
+            and observation_time_s < started_at_s
         ):
             self.get_logger().warn(
                 "忽略进入最终对准前拍摄的旧目标图像。",
@@ -679,7 +899,7 @@ class OffboardControl(Node):
             )
             return
 
-        pose = self._target_pose_at(measurement_time_s)
+        pose = self._target_pose_at(measurement_time_s, ned_epoch)
         camera_point = np.array([x, y, z, 1.0], dtype=float)
         if pose is None:
             self.get_logger().warn(
@@ -697,46 +917,70 @@ class OffboardControl(Node):
                 throttle_duration_sec=2,
             )
             return
-        receive_gap_s = None
+        # Serialize event changes with the final alignment/drop commit, while
+        # keeping image/pose matching and coordinate conversion outside locks.
+        with self._position_commit_lock:
+            with self._state_lock:
+                if (
+                    not self._alignment_active or self._session_epoch != session_epoch
+                    or self._alignment_ned_epoch != ned_epoch
+                    or self._received_pose.ned_epoch != ned_epoch
+                ):
+                    return
+                rejection = self._commit_target_observation_locked(
+                    target_ned, tuple(float(value) for value in values), confidence,
+                    observation_time_s, now, reset_state,
+                )
+        if rejection == 'timestamp':
+            self.get_logger().warn(
+                "忽略时间戳倒序或重复的目标观测。", throttle_duration_sec=2,
+            )
+        elif rejection == 'filtered':
+            self.get_logger().info(
+                "目标观测未通过NED锁定过滤，等待锁内有效观测。",
+                throttle_duration_sec=2,
+            )
+
+    def _commit_target_observation_locked(
+        self, target_ned, point, confidence, observation_time_s, now, reset_state,
+    ):
+        """Commit against current ingress timestamps; caller holds state lock."""
+        now_s = now.nanoseconds / 1e9
         accepted_stream_gap = False
-        if self.last_target_update_time is not None:
+        if self._received_target_at is not None:
             receive_gap_s = (
-                now - self.last_target_update_time
+                now - self._received_target_at
             ).nanoseconds / 1e9
             if receive_gap_s < 0.0:
                 self.target_anchor_tracker.reset()
-                self.last_target_measurement_time_s = None
-                self.target_stream_discontinuity_pending = True
+                self._received_measurement_time_s = None
+                self._discontinuity_seq += 1
             elif receive_gap_s > self.target_timeout_duration:
                 if self.target_anchor_tracker.lock_enabled:
                     accepted_stream_gap = True
                 else:
                     self.target_anchor_tracker.reset()
-                    self.target_stream_discontinuity_pending = True
+                    self._discontinuity_seq += 1
 
-        if self.last_target_measurement_time_s is not None:
+        if self._received_measurement_time_s is not None:
             measurement_gap_s = (
-                observation_time_s - self.last_target_measurement_time_s
+                observation_time_s - self._received_measurement_time_s
             )
             if measurement_gap_s <= 0.0:
-                self.get_logger().warn(
-                    "忽略时间戳倒序或重复的目标观测。",
-                    throttle_duration_sec=2,
-                )
-                return
+                return 'timestamp'
             if measurement_gap_s > self.target_timeout_duration:
                 if self.target_anchor_tracker.lock_enabled:
                     accepted_stream_gap = True
                 else:
                     self.target_anchor_tracker.reset()
-                    self.target_stream_discontinuity_pending = True
+                    self._discontinuity_seq += 1
 
         if (
-            self.target_anchor_reset_state is not None
-            and reset_state != self.target_anchor_reset_state
+            self._received_target_reset_state is not None
+            and reset_state != self._received_target_reset_state
         ):
             self.target_anchor_tracker.reset()
-            self.target_stream_discontinuity_pending = True
+            self._discontinuity_seq += 1
         old_anchor = self.target_anchor_tracker.anchor_ned
         result = self.target_anchor_tracker.ingest_observation(
             target_ned,
@@ -745,16 +989,12 @@ class OffboardControl(Node):
             now_s=now_s,
         )
         if not result.accepted:
-            self.get_logger().info(
-                "目标观测未通过NED锁定过滤，等待锁内有效观测。",
-                throttle_duration_sec=2,
-            )
-            return
+            return 'filtered'
         if result.lock_acquired or accepted_stream_gap:
             # The control loop clears alignment timers and PID history before
             # using the newly acquired/recovered observation.
-            self.target_stream_discontinuity_pending = True
-        self.target_anchor_reset_state = reset_state
+            self._discontinuity_seq += 1
+        self._received_target_reset_state = reset_state
         new_anchor = self.target_anchor_tracker.anchor_ned
         if old_anchor is not None and new_anchor is not None:
             anchor_jump = math.hypot(
@@ -762,15 +1002,15 @@ class OffboardControl(Node):
                 new_anchor[1] - old_anchor[1],
             )
             if anchor_jump >= self.second_alignment_checker.threshold:
-                self.target_anchor_jump_pending = True
+                self._jump_seq += 1
 
-        self.target_position = Point(x=float(x), y=float(y), z=float(z))
-        self.target_confidence = None if confidence is None else float(confidence)
-        self.last_target_update_time = now
-        self.last_target_measurement_time_s = observation_time_s
-        self.target_observation_sequence += 1
+        self._received_target_point = point
+        self._received_target_confidence = None if confidence is None else float(confidence)
+        self._received_target_at = now
+        self._received_measurement_time_s = observation_time_s
         if confidence is not None:
-            self.last_confident_target_update_time = now
+            self._received_confident_target_at = now
+        return None
 
     def target_observation_callback(self, msg: PointCloud):
         """Receive one stamped camera point with a confidence channel."""
@@ -813,9 +1053,11 @@ class OffboardControl(Node):
         if self.target_anchor_tracker.lock_enabled:
             return
         now = self.get_clock().now()
-        if self.last_confident_target_update_time is not None:
+        with self._state_lock:
+            last_confident_target_at = self._received_confident_target_at
+        if last_confident_target_at is not None:
             structured_age_s = (
-                now - self.last_confident_target_update_time
+                now - last_confident_target_at
             ).nanoseconds / 1e9
             # The new detector publishes the legacy Point immediately after the
             # confidence-bearing observation.  Ignore that duplicate while the
@@ -833,32 +1075,47 @@ class OffboardControl(Node):
 
     def vehicle_local_position_callback(self, vehicle_local_position):
         """Callback function for vehicle_local_position topic subscriber."""
-        with self._pose_lock:
-            self.vehicle_local_position = vehicle_local_position
-        current_reset_state = self._local_position_reset_state()
-        if (
-            self.is_final_aligning
-            and self.target_anchor_reset_state is not None
-            and current_reset_state != self.target_anchor_reset_state
-        ):
-            z_reference_changed = (
-                current_reset_state[1] != self.target_anchor_reset_state[1]
-            )
-            self._invalidate_target_anchor(
-                "PX4位置回调检测到本地NED参考重置：立即丢弃旧目标锚点。",
-                rebase_height=z_reference_changed,
-            )
-        self._record_target_pose_sample()
+        received_ns = self.get_clock().now().nanoseconds
+        reset_state = self._position_reset_state(vehicle_local_position)
+        with self._state_lock:
+            changed = reset_state != self._received_pose.reset_state
+        if changed:
+            # Only coordinate-system changes serialize with final publication.
+            with self._position_commit_lock:
+                with self._state_lock:
+                    old = self._received_pose
+                    pose = replace(
+                        old, position=vehicle_local_position,
+                        position_received_ns=received_ns, reset_state=reset_state,
+                        ned_epoch=old.ned_epoch + 1,
+                        z_reset_epoch=old.z_reset_epoch + int(
+                            reset_state[1] != old.reset_state[1]
+                        ),
+                        sequence=old.sequence + 1,
+                    )
+                    self._received_pose = pose
+                    self.target_pose_history.clear()
+        else:
+            with self._state_lock:
+                pose = replace(
+                    self._received_pose, position=vehicle_local_position,
+                    position_received_ns=received_ns,
+                    sequence=self._received_pose.sequence + 1,
+                )
+                self._received_pose = pose
+        # Pose ingress never resets PID, alignment timers or mission state.
+        self._record_target_pose_sample(pose)
 
     def _capture_widecam_pose_snapshot(self):
         """Return a valid NED/attitude state to associate with a camera frame."""
         # 相机回调与 PX4 位姿回调并行执行；一次性复制组合位姿，避免
         # position、roll/pitch 和姿态时间戳来自不同次更新。
-        with self._pose_lock:
-            position = self.vehicle_local_position
-            vehicle_roll = self.vehicle_roll
-            vehicle_pitch = self.vehicle_pitch
-            attitude_timestamp_us = self.vehicle_attitude_timestamp_us
+        with self._state_lock:
+            pose = self._received_pose
+        position = pose.position
+        vehicle_roll = pose.roll
+        vehicle_pitch = pose.pitch
+        attitude_timestamp_us = pose.attitude_timestamp_us
         values = (
             position.x,
             position.y,
@@ -914,12 +1171,14 @@ class OffboardControl(Node):
     def vehicle_status_callback(self, vehicle_status):
         """Callback function for vehicle_status topic subscriber."""
         # ===== 新增：首次收到数据时打印日志 =====
-        if self.vehicle_status.timestamp == 0 and vehicle_status.timestamp != 0:
+        with self._state_lock:
+            first_status = self._received_vehicle_status.timestamp == 0
+            self._received_vehicle_status = vehicle_status
+        if first_status and vehicle_status.timestamp != 0:
             self.get_logger().info(
                 f"首次收到带有效时间戳的飞控状态: nav_state={vehicle_status.nav_state}, "
                 f"arming_state={vehicle_status.arming_state}"
             )
-        self.vehicle_status = vehicle_status
     def vehicle_odometry_callback(self, msg: VehicleOdometry):
         """Callback to get the drone's full attitude (roll, pitch, yaw)."""
         # PX4 odometry msg.q is [w, x, y, z]
@@ -933,11 +1192,14 @@ class OffboardControl(Node):
         vehicle_roll, vehicle_pitch, _ = R.from_quat(q).as_euler(
             'xyz', degrees=False
         )
-        with self._pose_lock:
-            self.vehicle_roll = vehicle_roll
-            self.vehicle_pitch = vehicle_pitch
-            self.vehicle_attitude_timestamp_us = (
-                getattr(msg, 'timestamp_sample', 0) or getattr(msg, 'timestamp', 0)
+        with self._state_lock:
+            self._received_pose = replace(
+                self._received_pose, roll=vehicle_roll, pitch=vehicle_pitch,
+                attitude_timestamp_us=(
+                    getattr(msg, 'timestamp_sample', 0) or getattr(msg, 'timestamp', 0)
+                ),
+                attitude_received_ns=self.get_clock().now().nanoseconds,
+                sequence=self._received_pose.sequence + 1,
             )
         # Yaw我们继续使用更稳定的 vehicle_local_position.heading
 
@@ -998,7 +1260,12 @@ class OffboardControl(Node):
         else:
             msg.yaw = self.init_yaw  # (90 degree)
         msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
-        self.trajectory_setpoint_publisher.publish(msg)
+        with self._position_commit_lock:
+            with self._state_lock:
+                current_epoch = self._received_pose.ned_epoch
+            if current_epoch != self._control_ned_epoch:
+                return
+            self.trajectory_setpoint_publisher.publish(msg)
 
     def publish_vehicle_command(self, command, **params) -> None:
         """Publish a vehicle command."""
@@ -1026,10 +1293,6 @@ class OffboardControl(Node):
         # 清理视觉控制器（保存视频）
         if self.vision_controller:
             self.vision_controller.cleanup()
-        # 关闭日志文件
-        if hasattr(self, 'pixel_log_file') and not self.pixel_log_file.closed:
-            self.pixel_log_file.close()
-            self.get_logger().info("像素日志文件已关闭。")
         # # 清理摄像头
         if self.cap and self.cap.isOpened():
             self.cap.release()
@@ -1261,11 +1524,14 @@ class OffboardControl(Node):
             target_y=target_y
 )
         if is_align_now:
-            self.first_alignment_complete = True
-            self._pause_alignment_timeout('first')
-            self.second_align_start_timestamp = None
-            self.second_align_accumulated_s = 0.0
-            self.second_alignment_checker.reset()
+            with self._position_commit_lock:
+                if not self._alignment_commit_is_current():
+                    return
+                self.first_alignment_complete = True
+                self._pause_alignment_timeout('first')
+                self.second_align_start_timestamp = None
+                self.second_align_accumulated_s = 0.0
+                self.second_alignment_checker.reset()
             self.get_logger().info("------------------------first对准完成！------------------------")
 
     def second_alignment_check(self, target_x, target_y):
@@ -1277,8 +1543,11 @@ class OffboardControl(Node):
             target_y=target_y
         )
         if is_align_now:
-            self.second_alignment_complete = True
-            self._pause_alignment_timeout('second')
+            with self._position_commit_lock:
+                if not self._alignment_commit_is_current():
+                    return
+                self.second_alignment_complete = True
+                self._pause_alignment_timeout('second')
             self.get_logger().info("-------------------------second对准完成！------------------------")
 
     def fly_to_position_FRD2NED(self,x,y,z):
@@ -1320,7 +1589,10 @@ class OffboardControl(Node):
 
     def _local_position_reset_state(self):
         """Return PX4 counters identifying the current local NED reference."""
-        position = self.vehicle_local_position
+        return self._position_reset_state(self.vehicle_local_position)
+
+    @staticmethod
+    def _position_reset_state(position):
         return (
             int(getattr(position, 'xy_reset_counter', 0)),
             int(getattr(position, 'z_reset_counter', 0)),
@@ -1423,13 +1695,15 @@ class OffboardControl(Node):
         self.last_target_update_time = None
         self.last_confident_target_update_time = None
         self.last_target_measurement_time_s = None
-        self.target_anchor_tracker.reset()
         self.target_anchor_jump_pending = False
         self.target_stream_discontinuity_pending = False
         self.target_anchor_reset_state = self._local_position_reset_state()
         self.alignment_target_was_fresh = False
         self.final_alignment_started_at_s = (
             self.get_clock().now().nanoseconds / 1e9
+        )
+        self._reset_target_context(
+            self.is_final_aligning, self.final_alignment_started_at_s,
         )
         self.reached_align_height = False
         self._reset_active_alignment_tracking(reason, reset_timeout=True)
@@ -1489,12 +1763,10 @@ class OffboardControl(Node):
         self.last_confident_target_update_time = None
         self.last_target_measurement_time_s = None
         self.final_alignment_started_at_s = None
-        self.target_anchor_tracker.reset()
         self.target_anchor_jump_pending = False
         self.target_stream_discontinuity_pending = False
         self.target_anchor_reset_state = None
         self.alignment_target_was_fresh = False
-        self.last_logged_target_observation_sequence = -1
         self.last_found_x_NED = None
         self.last_found_y_NED = None
         self.last_found_z_NED = None
@@ -1507,7 +1779,7 @@ class OffboardControl(Node):
         # 重置TARGETING_CYCLE的内部状态
         self.is_navigating_to_target = False
         self.is_descending_for_drop = False
-        self.is_final_aligning = False
+        self._deactivate_final_alignment()
 
         self.is_drop_initiated_for_current_target = False
 
@@ -1542,14 +1814,10 @@ class OffboardControl(Node):
         self.last_target_update_time = None
         self.last_confident_target_update_time = None
         self.last_target_measurement_time_s = None
-        self.target_anchor_tracker.reset()
         self.target_anchor_jump_pending = False
         self.target_stream_discontinuity_pending = False
         self.target_anchor_reset_state = self._local_position_reset_state()
         self.alignment_target_was_fresh = False
-        self.last_logged_target_observation_sequence = (
-            self.target_observation_sequence
-        )
         self.integral_x = 0.0
         self.integral_y = 0.0
         self.last_error_x = 0.0
@@ -1562,6 +1830,7 @@ class OffboardControl(Node):
         )
         self.is_navigating_to_target = False
         self.is_final_aligning = True
+        self._reset_target_context(True, self.final_alignment_started_at_s)
 
     def _start_smooth_move(self, end_pos_ned: tuple):
         """
@@ -1619,6 +1888,8 @@ class OffboardControl(Node):
         """Adjust drone position towards the current target."""
         now = self.get_clock().now()
         now_s = now.nanoseconds / 1e9
+        if not self._refresh_control_target_snapshot(now_s):
+            return
 
         current_reset_state = self._local_position_reset_state()
         if (
@@ -1635,9 +1906,13 @@ class OffboardControl(Node):
 
         is_target_valid = False
         receive_age_s = math.inf
-        measurement_age_s = self.target_anchor_tracker.latest_observation_age_s(
-            now_s
+        snapshot = self._control_target_snapshot
+        measurement_age_s = (
+            math.inf if snapshot.last_observation_at_s is None
+            else now_s - snapshot.last_observation_at_s
         )
+        if not math.isfinite(measurement_age_s) or measurement_age_s < 0.0:
+            measurement_age_s = math.inf
         if self.target_position and self.last_target_update_time:
             receive_age_s = (
                 now - self.last_target_update_time
@@ -1662,44 +1937,14 @@ class OffboardControl(Node):
                     )
                 )
 
-        old_anchor = self.target_anchor_tracker.anchor_ned
-        self.target_anchor_tracker.refresh(now_s)
-        new_anchor = self.target_anchor_tracker.anchor_ned
-        if old_anchor is not None and new_anchor is not None and old_anchor != new_anchor:
-            anchor_jump = math.hypot(
-                new_anchor[0] - old_anchor[0],
-                new_anchor[1] - old_anchor[1],
-            )
-            if anchor_jump >= self.second_alignment_checker.threshold:
-                self.target_anchor_jump_pending = True
-
         p_dropper_in_world = self._current_dropper_ned()
         has_active_anchor = (
-            self.target_anchor_tracker.is_active(now_s)
+            snapshot.anchor_ned is not None
+            and measurement_age_s <= self.target_anchor_tracker.hold_duration_s
             and p_dropper_in_world is not None
         )
         alignment_data_valid = is_target_valid and has_active_anchor
-
-        if self.target_stream_discontinuity_pending:
-            self._reset_active_alignment_tracking(
-                "目标观测时间不连续：重新开始连续对准计时。",
-                reset_timeout=True,
-            )
-            self.target_stream_discontinuity_pending = False
-            self.alignment_target_was_fresh = False
-            self.target_anchor_jump_pending = False
-        elif self.alignment_target_was_fresh and not alignment_data_valid:
-            self._reset_active_alignment_tracking(
-                "目标观测中断：重置连续对准计时，但短时继续追踪固定NED锚点。"
-            )
-            self.target_anchor_jump_pending = False
-        elif alignment_data_valid and self.target_anchor_jump_pending:
-            self._reset_active_alignment_tracking(
-                "最高置信度目标锚点发生明显变化：重新开始连续对准计时。",
-                reset_timeout=True,
-            )
-            self.target_anchor_jump_pending = False
-        self.alignment_target_was_fresh = alignment_data_valid
+        self._consume_target_events(alignment_data_valid)
 
         is_in_second_alignment = self.first_alignment_complete and not self.second_alignment_complete
         is_in_first_alignment = not self.first_alignment_complete
@@ -1760,7 +2005,7 @@ class OffboardControl(Node):
 
                     ### MODIFIED ###
                     # 进入投放后等待状态，而不是直接重置
-                    self.is_final_aligning = False
+                    self._deactivate_final_alignment()
                     self.is_waiting_post_drop = True
                     self.post_drop_start_time = self.get_clock().now()
                     return
@@ -1780,7 +2025,7 @@ class OffboardControl(Node):
 
                     ### MODIFIED ###
                     # 进入投放后等待状态，而不是直接重置
-                    self.is_final_aligning = False
+                    self._deactivate_final_alignment()
                     self.is_waiting_post_drop = True
                     self.post_drop_start_time = self.get_clock().now()
 
@@ -1817,7 +2062,7 @@ class OffboardControl(Node):
 
                     ### MODIFIED ###
                     # 进入投放后等待状态，而不是直接重置
-                    self.is_final_aligning = False
+                    self._deactivate_final_alignment()
                     self.is_waiting_post_drop = True
                     self.post_drop_start_time = self.get_clock().now()
                     return
@@ -1837,7 +2082,7 @@ class OffboardControl(Node):
 
                     ### MODIFIED ###
                     # 进入投放后等待状态，而不是直接重置
-                    self.is_final_aligning = False
+                    self._deactivate_final_alignment()
                     self.is_waiting_post_drop = True
                     self.post_drop_start_time = self.get_clock().now()
 
@@ -1845,25 +2090,8 @@ class OffboardControl(Node):
 
 
         if has_active_anchor:
-            # 每条新观测只记录一次；控制循环使用固定的世界坐标锚点。
-            if (
-                alignment_data_valid
-                and self.target_observation_sequence
-                != self.last_logged_target_observation_sequence
-            ):
-                self.pixel_log_writer.writerow([
-                    time.time(),
-                    self.target_position.x,
-                    self.target_position.y,
-                    self.target_confidence,
-                    "second" if self.first_alignment_complete else "first",
-                ])
-                self.last_logged_target_observation_sequence = (
-                    self.target_observation_sequence
-                )
-
             target_anchor_ned = np.asarray(
-                self.target_anchor_tracker.anchor_ned,
+                snapshot.anchor_ned,
                 dtype=float,
             )
             error_ned = target_anchor_ned - p_dropper_in_world
@@ -1877,8 +2105,8 @@ class OffboardControl(Node):
             if self.log_counter % 25 == 0:
                 confidence_text = (
                     "legacy"
-                    if self.target_anchor_tracker.anchor_confidence is None
-                    else f"{self.target_anchor_tracker.anchor_confidence:.3f}"
+                    if snapshot.anchor_confidence is None
+                    else f"{snapshot.anchor_confidence:.3f}"
                 )
                 self.get_logger().info(
                     "追踪固定NED目标: (%.3f, %.3f), confidence=%s, fresh=%s"
@@ -2002,7 +2230,8 @@ class OffboardControl(Node):
             if self.first_alignment_complete and self.second_alignment_complete and not self.is_drop_initiated_for_current_target:
     # 只负责启动，不设置完成标志
                 if self.current_dropping_state[1] == DroppingState.IDLE and not self.Is_Finish_1st_Drop:
-                    self.drop_payload(1) # 启动第一次投水
+                    if not self._drop_aligned_payload(1):
+                        return
                     self.is_drop_initiated_for_current_target = True
                     self.second_align_start_timestamp = None
 
@@ -2016,7 +2245,7 @@ class OffboardControl(Node):
                     ### MODIFIED ###
                     # 进入投放后等待状态，而不是直接重置
                     self.reached_align_height = False
-                    self.is_final_aligning = False
+                    self._deactivate_final_alignment()
                     self.is_waiting_post_drop = True
                     self.post_drop_start_time = self.get_clock().now()
                     return
@@ -2024,7 +2253,8 @@ class OffboardControl(Node):
 
 
                 elif self.current_dropping_state[2] == DroppingState.IDLE and self.Is_Finish_1st_Drop and not self.Is_Finish_2nd_Drop:
-                    self.drop_payload(2) # 启动第二次投水
+                    if not self._drop_aligned_payload(2):
+                        return
                     self.is_drop_initiated_for_current_target = True
                     self.second_align_start_timestamp = None
 
@@ -2038,7 +2268,7 @@ class OffboardControl(Node):
                     ### MODIFIED ###
                     # 进入投放后等待状态，而不是直接重置
                     self.reached_align_height = False
-                    self.is_final_aligning = False
+                    self._deactivate_final_alignment()
                     self.is_waiting_post_drop = True
                     self.post_drop_start_time = self.get_clock().now()
 
@@ -2266,6 +2496,7 @@ class OffboardControl(Node):
     def control_timer_callback(self) -> None:
         """Callback function for the timer."""
         timer_start = self.get_clock().now()
+        self._capture_control_snapshot()
 
         # 模型加载和 USB 采集分别由视觉组、相机组负责。任务状态机只消费
         # 完整快照，不能再同步等待这些耗时操作。
@@ -2389,9 +2620,13 @@ class OffboardControl(Node):
                     self.drop_phase_start_time = self.get_clock().now()
 
                 elapsed_drop_time = (self.get_clock().now() - self.drop_phase_start_time).nanoseconds / 1e9
-                if elapsed_drop_time > self.drop_phase_timeout:
+                if (
+                    elapsed_drop_time > self.drop_phase_timeout
+                    and self.mission_state != MissionState.TIMEOUT_DROP
+                ):
                     # self.get_logger().warn(f"投放阶段整体超时（超过 {self.drop_phase_timeout} 秒），进入强制投放流程。")
                     # <<< 修改：不再直接投放，而是切换到专用状态 >>>
+                    self._deactivate_final_alignment()
                     self.mission_state = MissionState.TIMEOUT_DROP
                 #======启动投放区域计时模块========
 
@@ -2425,6 +2660,7 @@ class OffboardControl(Node):
 
                         if not self.mission_targets_ned:
                             self.get_logger().error("搜索结束但未规划任何有效目标！进入超时投放。")
+                            self._deactivate_final_alignment()
                             self.mission_state = MissionState.TIMEOUT_DROP
                         else:
                             # ==================== 启动平滑下降过程 ====================
@@ -2492,6 +2728,7 @@ class OffboardControl(Node):
                             self.get_logger().warn(
                                 "已无剩余可打击目标，但仍有未投放载荷，进入强制投放流程。"
                             )
+                            self._deactivate_final_alignment()
                             self.mission_state = MissionState.TIMEOUT_DROP
                         return
 
@@ -2789,6 +3026,7 @@ class OffboardControl(Node):
         with self._vision_result_lock:
             if self.mission_state == MissionState.RETURN_TO_CENTER_DROPAREA:
                 return
+            self._deactivate_final_alignment()
             self.vision_epoch += 1
             self.latest_vision_info = []
             self.latest_vision_frame_pose = None
@@ -3177,10 +3415,20 @@ class OffboardControl(Node):
 
 def spin_control_node_safely(node: OffboardControl) -> None:
     """Run ROS callbacks on five workers while keeping OpenCV GUI on main."""
-    executor = MultiThreadedExecutor(num_threads=5)
+    executor = PriorityExecutor(
+        critical_groups=(
+            node.mission_callback_group, node.target_callback_group,
+            node.heartbeat_callback_group, node.pose_callback_group,
+        ),
+        auxiliary_groups=(
+            node.image_callback_group, node.vision_callback_group,
+            node.widecam_debug_callback_group,
+        ),
+        priority_warning=node.get_logger().warn,
+    )
     executor.add_node(node)
     # ServoControl 是另一个 ROS Node；只有加入 executor 后它的订阅回调才会执行。
-    executor.add_node(node.servo_control)
+    executor.add_critical_node(node.servo_control)
     executor_stop = threading.Event()
 
     def spin_executor():
