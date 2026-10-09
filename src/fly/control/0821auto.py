@@ -453,6 +453,11 @@ class OffboardControl(Node):
             selection_mode=args.target_anchor_mode,
             lock_enabled=args.lock_enabled == 'true',
             newest_confidence_threshold=args.newest_confidence_threshold,
+            ned_fix_distance=args.ned_fix_distance,
+            ned_fix_time_s=args.ned_fix_time,
+            ned_fix_release_distance=args.ned_fix_release_distance,
+            ned_fix_release_time_s=args.ned_fix_release_time,
+            observation_timeout_s=args.target_timeout_duration,
         )
         self.target_anchor_jump_pending = False
         self.target_anchor_reset_state = None
@@ -697,7 +702,9 @@ class OffboardControl(Node):
             ):
                 return False
             old_anchor = self.target_anchor_tracker.anchor_ned
+            was_fixed = self.target_anchor_tracker.ned_fixed
             self.target_anchor_tracker.refresh(now_s)
+            fixed_expired = was_fixed and not self.target_anchor_tracker.ned_fixed
             new_anchor = self.target_anchor_tracker.anchor_ned
             if old_anchor is not None and new_anchor is not None:
                 if math.hypot(
@@ -706,6 +713,8 @@ class OffboardControl(Node):
                     self._jump_seq += 1
             snapshot = self._target_snapshot_locked()
         self._install_target_snapshot(snapshot)
+        if fixed_expired:
+            self.get_logger().info("ned-fix固定状态已失效：恢复动态目标选择。")
         return True
 
     def _alignment_commit_is_current(self):
@@ -720,6 +729,38 @@ class OffboardControl(Node):
                 and self._jump_seq == snapshot.jump_seq
             )
 
+    def _update_ned_fix(self, now_s, snapshot, dropper_ned, eligible):
+        """Commit a freeze only for the same target session and NED snapshot."""
+        distance_m = (
+            math.inf if snapshot.anchor_ned is None or dropper_ned is None
+            else math.hypot(
+                snapshot.anchor_ned[0] - dropper_ned[0],
+                snapshot.anchor_ned[1] - dropper_ned[1],
+            )
+        )
+        with self._position_commit_lock:
+            with self._state_lock:
+                if (
+                    not self._alignment_active
+                    or self._received_pose.ned_epoch != self._control_ned_epoch
+                    or self._alignment_ned_epoch != snapshot.ned_epoch
+                    or self._session_epoch != snapshot.session_epoch
+                ):
+                    return False
+                if self._target_snapshot_locked() != snapshot:
+                    # This cycle cannot certify continuous proximity. Do not
+                    # disturb a fixed point's observation-driven release timer.
+                    self.target_anchor_tracker.update_ned_fix(now_s, math.inf, False)
+                    return False
+                fixed = self.target_anchor_tracker.update_ned_fix(
+                    now_s, distance_m, eligible,
+                )
+        if fixed:
+            self.get_logger().info(
+                "ned-fix固定目标NED: (%.3f, %.3f, %.3f)" % snapshot.anchor_ned
+            )
+        return fixed
+
     def _drop_aligned_payload(self, number):
         """Do not turn an invalidated precision result into a normal drop."""
         with self._position_commit_lock:
@@ -732,6 +773,10 @@ class OffboardControl(Node):
     def _consume_target_events(self, alignment_data_valid):
         """Preserve original reset priority without clearing concurrent events."""
         snapshot = self._control_target_snapshot
+        if self.target_anchor_tracker.selection_mode == 'ned-fix' and (
+            self.target_stream_discontinuity_pending or self.target_anchor_jump_pending
+        ):
+            self.second_alignment_complete = False
         if self.target_stream_discontinuity_pending:
             self._reset_active_alignment_tracking(
                 "目标观测时间不连续：重新开始连续对准计时。",
@@ -940,12 +985,24 @@ class OffboardControl(Node):
                 "目标观测未通过NED锁定过滤，等待锁内有效观测。",
                 throttle_duration_sec=2,
             )
+        elif rejection == 'reselected':
+            self.get_logger().info(
+                "ned-fix偏差持续超限：解除固定，重新对准NED: (%.3f, %.3f, %.3f)"
+                % tuple(float(value) for value in target_ned)
+            )
 
     def _commit_target_observation_locked(
         self, target_ned, point, confidence, observation_time_s, now, reset_state,
     ):
         """Commit against current ingress timestamps; caller holds state lock."""
         now_s = now.nanoseconds / 1e9
+        ned_fix_mode = self.target_anchor_tracker.selection_mode == 'ned-fix'
+        if (
+            ned_fix_mode and self._received_measurement_time_s is not None
+            and observation_time_s <= self._received_measurement_time_s
+            and (self._received_target_at is None or now >= self._received_target_at)
+        ):
+            return 'timestamp'
         accepted_stream_gap = False
         if self._received_target_at is not None:
             receive_gap_s = (
@@ -956,7 +1013,10 @@ class OffboardControl(Node):
                 self._received_measurement_time_s = None
                 self._discontinuity_seq += 1
             elif receive_gap_s > self.target_timeout_duration:
-                if self.target_anchor_tracker.lock_enabled:
+                if ned_fix_mode:
+                    self.target_anchor_tracker.reset_ned_fix_timers()
+                    accepted_stream_gap = True
+                elif self.target_anchor_tracker.lock_enabled:
                     accepted_stream_gap = True
                 else:
                     self.target_anchor_tracker.reset()
@@ -969,7 +1029,10 @@ class OffboardControl(Node):
             if measurement_gap_s <= 0.0:
                 return 'timestamp'
             if measurement_gap_s > self.target_timeout_duration:
-                if self.target_anchor_tracker.lock_enabled:
+                if ned_fix_mode:
+                    self.target_anchor_tracker.reset_ned_fix_timers()
+                    accepted_stream_gap = True
+                elif self.target_anchor_tracker.lock_enabled:
                     accepted_stream_gap = True
                 else:
                     self.target_anchor_tracker.reset()
@@ -996,7 +1059,11 @@ class OffboardControl(Node):
             self._discontinuity_seq += 1
         self._received_target_reset_state = reset_state
         new_anchor = self.target_anchor_tracker.anchor_ned
-        if old_anchor is not None and new_anchor is not None:
+        if result.anchor_reselected:
+            # A replacement invalidates old precision results even below the
+            # regular alignment jump threshold. The control group consumes it.
+            self._jump_seq += 1
+        elif old_anchor is not None and new_anchor is not None:
             anchor_jump = math.hypot(
                 new_anchor[0] - old_anchor[0],
                 new_anchor[1] - old_anchor[1],
@@ -1010,7 +1077,7 @@ class OffboardControl(Node):
         self._received_measurement_time_s = observation_time_s
         if confidence is not None:
             self._received_confident_target_at = now
-        return None
+        return 'reselected' if result.anchor_reselected else None
 
     def target_observation_callback(self, msg: PointCloud):
         """Receive one stamped camera point with a confidence channel."""
@@ -1967,6 +2034,12 @@ class OffboardControl(Node):
         )
         first_stage_eligible = alignment_data_valid and first_altitude_ok
         second_stage_eligible = alignment_data_valid and second_altitude_ok
+
+        if self.target_anchor_tracker.selection_mode == 'ned-fix':
+            self._update_ned_fix(
+                now_s, snapshot, p_dropper_in_world,
+                is_in_second_alignment and second_stage_eligible,
+            )
 
         if is_in_first_alignment and not first_stage_eligible:
             if self.first_align_start_timestamp is not None:
@@ -3503,11 +3576,19 @@ def main(args=None) -> None:
     parser.add_argument('--target-confidence-window', type=float, default=4.0,
                         help='目标锚点候选观测的滚动时间窗（秒）。')
     parser.add_argument('--target-anchor-mode',
-                        choices=('max-confidence', 'top25', 'newest'),
+                        choices=('max-confidence', 'top25', 'newest', 'ned-fix'),
                         default='max-confidence',
-                        help='目标锚点策略：最高置信度、最高25%%坐标中位数，或最新达标观测。')
+                        help='目标锚点策略：最高置信度、最高25%%中位数、最新达标观测，或ned-fix固定输出。')
     parser.add_argument('--newest-confidence-threshold', type=float, default=0.9,
                         help='仅newest模式使用的置信度阈值，达到阈值才更新锚点（默认0.9）。')
+    parser.add_argument('--ned-fix-distance', type=float, default=0.08,
+                        help='仅ned-fix：投放器接近桶的水平固定距离（米，默认0.08）。')
+    parser.add_argument('--ned-fix-time', type=float, default=1.0,
+                        help='仅ned-fix：高度、有效观测和接近条件连续满足的时间（秒，默认1）。')
+    parser.add_argument('--ned-fix-release-distance', type=float, default=0.08,
+                        help='仅ned-fix：实时桶NED与固定点的水平偏差阈值（米，默认0.08）。')
+    parser.add_argument('--ned-fix-release-time', type=float, default=1.0,
+                        help='仅ned-fix：偏差连续超限多久后解除固定并重选（秒，默认1）。')
     parser.add_argument('--lock-enabled', choices=('true', 'false'), default='false',
                         help='启用NED水平1米目标锁；生命周期复用目标置信度窗口（默认关闭）。')
     parser.add_argument('--target-anchor-hold-duration', type=float, default=2.5,
@@ -3687,6 +3768,19 @@ def main(args=None) -> None:
         or not 0.0 <= custom_args.newest_confidence_threshold <= 1.0
     ):
         parser.error('--newest-confidence-threshold must be in [0, 1]')
+    if custom_args.target_anchor_mode == 'ned-fix':
+        for option, value in (
+            ('--ned-fix-distance', custom_args.ned_fix_distance),
+            ('--ned-fix-release-distance', custom_args.ned_fix_release_distance),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                parser.error(f'{option} must be positive and finite')
+        for option, value in (
+            ('--ned-fix-time', custom_args.ned_fix_time),
+            ('--ned-fix-release-time', custom_args.ned_fix_release_time),
+        ):
+            if not math.isfinite(value) or value < 0.0:
+                parser.error(f'{option} must be non-negative and finite')
     if (
         not math.isfinite(custom_args.target_anchor_hold_duration)
         or custom_args.target_anchor_hold_duration < 0.0
@@ -3793,6 +3887,10 @@ def main(args=None) -> None:
             print(f"  - NED锁时间窗口: {custom_args.target_confidence_window} 秒")
     else:
         print(f"  - 目标锚点策略: {custom_args.target_anchor_mode}, 时间窗口: {custom_args.target_confidence_window} 秒")
+    if custom_args.target_anchor_mode == 'ned-fix':
+        print(f"  - ned-fix固定条件: 距离 < {custom_args.ned_fix_distance} 米, 连续 {custom_args.ned_fix_time} 秒")
+        print(f"  - ned-fix重选条件: 偏差 > {custom_args.ned_fix_release_distance} 米, 连续 {custom_args.ned_fix_release_time} 秒")
+        print(f"  - ned-fix丢失解除: 超过 {custom_args.target_anchor_hold_duration} 秒")
     print(f"  - NED目标锁定: {'已启用' if custom_args.lock_enabled == 'true' else '已禁用'}")
     print("------------------ 模式设置 ------------------")
     print(f"  - 视频录制: {'已启用' if custom_args.record_video else '已禁用'}")
